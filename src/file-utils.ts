@@ -10,30 +10,38 @@ import { join, relative } from 'node:path'
 /**
  * Test whether a path matches any of the given glob-style patterns.
  *
- * Supports `**`, `*`, and `?` wildcards.
+ * Supports **, *, and ? wildcards.
  */
 export function matchesPattern(path: string, patterns: string[]): boolean {
+  const normalizedPath = path.replace(/\\/g, '/')
+  
   return patterns.some((pattern) => {
-    // Basic glob to regex conversion
-    let regexStr = pattern
-      .replace(/\./g, '\\.')
-      .replace(/\*\*/g, '(.+)')
-      .replace(/\*/g, '([^/]+)')
-      .replace(/\?/g, '(.)')
+    // 1. Escape all regex special chars
+    let p = pattern.replace(/[.+*?^${}()|[\]\\]/g, '\\$&')
 
-    // Handle brace expansion like {vue,ts,tsx}
-    const braceRegex = /\{([^}]+)\}/g
-    regexStr = regexStr.replace(braceRegex, (_, group) => {
-      return `(${group.replace(/,/g, '|')})`
-    })
+    // 2. Handle the specific **/ pattern to match zero or more directories
+    // We use a safe intermediate marker for escaped **
+    p = p.replace(/\\\*\\\*\//g, '(.+/)?') // **/ -> (.*)?/?
+    p = p.replace(/\\\/\*\\\*/g, '(/.+)?') // /** -> (/.*)?
+    p = p.replace(/\\\*\\\*/g, '.*')       // remaining ** -> .*
+    p = p.replace(/\\\*/g, '[^/]*')        // * -> [^/]*
+    p = p.replace(/\\\?/g, '.')            // ? -> .
 
-    return new RegExp(`^${regexStr}$`).test(path) || new RegExp(`${regexStr}$`).test(path)
+    // 3. Handle brace expansion {vue,ts}
+    p = p.replace(/\{([^}]+)\}/g, (_, group) => `(${group.replace(/,/g, '|')})`)
+
+    try {
+      const regex = new RegExp(`^${p}$`)
+      const regexSuffix = new RegExp(`${p}$`)
+      return regex.test(normalizedPath) || regexSuffix.test(normalizedPath)
+    } catch {
+      return false
+    }
   })
 }
 
 /**
  * Recursively find all files in a directory that match the patterns.
- * Also supports direct file paths.
  */
 export function findFiles(
   dirPath: string,
@@ -43,21 +51,20 @@ export function findFiles(
 ): string[] {
   if (!existsSync(dirPath)) return []
 
-  const stats = statSync(dirPath)
-  
-  // If it's already a file, check if it matches includes
-  if (stats.isFile()) {
-    const relativePath = relative(basePath, dirPath)
-    if (matchesPattern(relativePath, includePatterns) && !matchesPattern(relativePath, excludePatterns)) {
-      return [relativePath]
-    }
-    return []
-  }
-
-  if (!stats.isDirectory()) return []
-
-  const results: string[] = []
   try {
+    const stats = statSync(dirPath)
+    
+    if (stats.isFile()) {
+      const relativePath = relative(basePath, dirPath)
+      if (matchesPattern(relativePath, includePatterns) && !matchesPattern(relativePath, excludePatterns)) {
+        return [relativePath]
+      }
+      return []
+    }
+
+    if (!stats.isDirectory()) return []
+
+    const results: string[] = []
     const entries = readdirSync(dirPath)
 
     for (const entry of entries) {
@@ -74,17 +81,12 @@ export function findFiles(
         results.push(relativePath)
       }
     }
+    return results
   } catch {
-    // Silently skip unreadable directories (permissions, symlinks, etc.)
+    return []
   }
-
-  return results
 }
 
-/**
- * Read a file and return its content.
- * Returns `null` when the file cannot be read.
- */
 export function readFile(filePath: string): string | null {
   try {
     return readFileSync(filePath, 'utf-8')
@@ -93,16 +95,23 @@ export function readFile(filePath: string): string | null {
   }
 }
 
-/**
- * Collect all files mapping to the supported extensions from multiple `scanPaths` relative to `basePath`.
- */
 export function getAllFiles(
   scanPaths: string[],
   includePatterns: string[],
   excludePatterns: string[],
   basePath: string,
 ): string[] {
-  return scanPaths.flatMap((scanPath) =>
-    findFiles(join(basePath, scanPath), includePatterns, excludePatterns, basePath),
-  )
+  const allFiles: string[] = []
+  for (const scanPath of scanPaths) {
+    const fullPath = join(basePath, scanPath)
+    if (existsSync(fullPath)) {
+      allFiles.push(...findFiles(fullPath, includePatterns, excludePatterns, basePath))
+    } else {
+      const relPath = relative(basePath, fullPath)
+      if (matchesPattern(relPath, includePatterns) && !matchesPattern(relPath, excludePatterns)) {
+        allFiles.push(relPath)
+      }
+    }
+  }
+  return [...new Set(allFiles)]
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { generateMarkdownReport, generateJsonReport, generateSummary } from '../src/report-formatter.js'
-import type { ExtractionReport } from '../src/types.js'
+import { generateMarkdownReport, generateJsonReport, generateSummary } from '../report-formatter.js'
+import type { ExtractionReport } from '../types.js'
 
 const makeReport = (): ExtractionReport => ({
   totalFiles: 5,
@@ -38,7 +38,7 @@ const makeReport = (): ExtractionReport => ({
 describe('generateMarkdownReport', () => {
   it('contains report header', () => {
     const md = generateMarkdownReport(makeReport())
-    expect(md).toContain('# i18n Extraction Report')
+    expect(md).toContain('# i18n-hunter Hunt Report')
   })
 
   it('contains file count', () => {

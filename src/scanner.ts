@@ -89,6 +89,7 @@ function scanVueFile(filePath: string, basePath: string): ScanResult[] {
             hardcodedString: r.value,
             suggestedKey: generateSmartKey(r.value, fileScope, category),
             context: r.context || 'template',
+            category,
           }
         }),
       )
@@ -109,6 +110,7 @@ function scanVueFile(filePath: string, basePath: string): ScanResult[] {
             hardcodedString: r.value,
             suggestedKey: generateSmartKey(r.value, fileScope, category),
             context: r.context || 'script',
+            category,
             isNotification: r.isNotification,
             notificationType: r.notificationType,
           }
@@ -143,6 +145,7 @@ function scanScriptFile(filePath: string, basePath: string): ScanResult[] {
         hardcodedString: s.value,
         suggestedKey: generateSmartKey(s.value, fileScope, category),
         context: s.context,
+        category,
         isNotification: s.isNotification,
         notificationType: s.notificationType,
       }
