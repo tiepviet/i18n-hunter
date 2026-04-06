@@ -1,0 +1,88 @@
+{
+  "name": "i18n-hunter",
+  "version": "0.1.0",
+  "description": "Hunt down every hardcoded string in your Vue/React project and automate your i18n workflow.",
+  "keywords": [
+    "i18n",
+    "scanner",
+    "hunter",
+    "extract",
+    "vue",
+    "react",
+    "localization",
+    "automation",
+    "detect",
+    "sync"
+  ],
+  "homepage": "https://github.com/tiepviet/i18n-hunter#readme",
+  "bugs": {
+    "url": "https://github.com/tiepviet/i18n-hunter/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tiepviet/i18n-hunter.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "tiepviet",
+    "url": "https://github.com/tiepviet"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "i18n-hunter": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write src/**/*.ts",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@vue/compiler-dom": "^3.0.0",
+    "@vue/compiler-sfc": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@vue/compiler-dom": {
+      "optional": true
+    },
+    "@vue/compiler-sfc": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@babel/parser": "^7.29.2",
+    "@babel/types": "^7.29.0",
+    "@types/node": "^20.14.10",
+    "@vue/compiler-dom": "^3.5.0",
+    "@vue/compiler-sfc": "^3.5.0",
+    "tsup": "^8.1.0",
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
