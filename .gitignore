@@ -3,3 +3,5 @@ dist/
 coverage/
 *.log
 i18n-reports/
+.i18n-hunter/
+*.i18n-hunter.bak

@@ -1,127 +1,179 @@
-/**
- * Report Formatter
- *
- * Converts an {@link ExtractionReport} to Markdown, JSON, or both,
- * and writes them to the filesystem.
- */
-
-import type { ExtractionReport, ScanResult } from './types.js'
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { atomicWriteFile } from './atomic-write.js'
+import { ExtractionReportSchema } from './report-schema.js'
+import {
+  findingCategories,
+  type CategorizedResults,
+  type ExtractionReport,
+  type FindingCategory,
+  type ScanResult,
+} from './types.js'
 
 export interface ExportOptions {
-  /** Output directory */
   outputDir: string
-  /** Base filename without extension */
   filename: string
-  /** Export as JSON (default: true) */
   json?: boolean
-  /** Export as Markdown (default: true) */
   markdown?: boolean
-  /** Pretty-print JSON (default: true) */
   prettyJson?: boolean
 }
 
-// ─────────────────────────────────────────────
-// Public API
-// ─────────────────────────────────────────────
+export function categorizeFindings(findings: ScanResult[]): CategorizedResults {
+  const categorized: CategorizedResults = {
+    labels: [],
+    buttons: [],
+    messages: [],
+    errors: [],
+    notifications: [],
+  }
 
-/** Generate a Markdown-formatted extraction report. */
-export function generateMarkdownReport(report: ExtractionReport): string {
+  const categoryMap: Record<FindingCategory, keyof CategorizedResults> = {
+    label: 'labels',
+    button: 'buttons',
+    message: 'messages',
+    error: 'errors',
+    notification: 'notifications',
+  }
+
+  for (const finding of findings) categorized[categoryMap[finding.category]].push(finding)
+  return categorized
+}
+
+export function generateMarkdownReport(input: ExtractionReport): string {
+  const report = ExtractionReportSchema.parse(input)
+  const categorized = categorizeFindings(report.findings)
   const lines: string[] = [
     '# i18n-hunter Hunt Report',
     '',
-    `**Generated:** ${new Date().toISOString()}`,
+    `**Generated:** ${report.generatedAt}`,
+    '',
+    report.complete ? '**Scan status:** Complete' : '**Scan status:** Incomplete',
     '',
     '## Summary',
     '',
-    `- **Total Files Scanned:** ${report.totalFiles}`,
-    `- **Total Hardcoded Strings Found:** ${report.totalStrings}`,
+    `- **Files discovered:** ${report.summary.filesDiscovered}`,
+    `- **Files scanned:** ${report.summary.filesScanned}`,
+    `- **Hardcoded strings found:** ${report.summary.findings}`,
     '',
-    '### Breakdown by Category',
+    '### Breakdown by category',
     '',
-    `- Labels: ${report.categorizedResults.labels.length}`,
-    `- Buttons: ${report.categorizedResults.buttons.length}`,
-    `- Messages: ${report.categorizedResults.messages.length}`,
-    `- Errors: ${report.categorizedResults.errors.length}`,
-    `- Notifications: ${report.categorizedResults.notifications.length}`,
+    ...findingCategories.map(
+      (category) =>
+        `- ${category[0]!.toUpperCase()}${category.slice(1)}: ${report.summary.categories[category]}`,
+    ),
     '',
   ]
 
+  if (report.diagnostics.length > 0) {
+    lines.push('## Diagnostics', '')
+    for (const diagnostic of report.diagnostics) {
+      const location = diagnostic.filePath ? ` ${inlineCode(diagnostic.filePath)}` : ''
+      const message = escapeMarkdown(diagnostic.message).replace(/[\r\n]+/gu, ' ')
+      lines.push(
+        `- **${escapeMarkdown(diagnostic.severity.toUpperCase())}** ${inlineCode(diagnostic.code)}${location}: ${message}`,
+      )
+    }
+    lines.push('')
+  }
+
   const sections: Array<[string, ScanResult[]]> = [
-    ['Labels', report.categorizedResults.labels],
-    ['Buttons', report.categorizedResults.buttons],
-    ['Messages', report.categorizedResults.messages],
-    ['Errors', report.categorizedResults.errors],
-    ['Notifications', report.categorizedResults.notifications],
+    ['Labels', categorized.labels],
+    ['Buttons', categorized.buttons],
+    ['Messages', categorized.messages],
+    ['Errors', categorized.errors],
+    ['Notifications', categorized.notifications],
   ]
 
   for (const [heading, results] of sections) {
     if (results.length === 0) continue
     lines.push(`## ${heading}`, '')
-    for (const r of results) {
-      lines.push(formatResult(r), '')
-    }
+    for (const result of results) lines.push(formatResult(result), '')
   }
 
-  return lines.join('\n')
+  return `${lines.join('\n').trimEnd()}\n`
 }
 
-/** Generate a JSON-formatted extraction report. */
 export function generateJsonReport(report: ExtractionReport, pretty = true): string {
-  return pretty ? JSON.stringify(report, null, 2) : JSON.stringify(report)
+  const validated = ExtractionReportSchema.parse(report)
+  return pretty ? JSON.stringify(validated, null, 2) : JSON.stringify(validated)
 }
 
-/** Export a report to one or both file formats, returning created file paths. */
-export function exportReport(report: ExtractionReport, options: ExportOptions): string[] {
+export function exportReport(reportInput: ExtractionReport, options: ExportOptions): string[] {
+  const report = ExtractionReportSchema.parse(reportInput)
   const { outputDir, filename, json = true, markdown = true, prettyJson = true } = options
-
-  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
-
+  const safeFilename = validateFilename(filename)
   const created: string[] = []
 
   if (json) {
-    const p = join(outputDir, `${filename}.json`)
-    writeFileSync(p, generateJsonReport(report, prettyJson), 'utf-8')
-    created.push(p)
-    console.log(`[i18n-hunter] JSON report: ${p}`)
+    const path = join(outputDir, `${safeFilename}.json`)
+    atomicWriteFile(path, generateJsonReport(report, prettyJson), 0o600)
+    created.push(path)
   }
 
   if (markdown) {
-    const p = join(outputDir, `${filename}.md`)
-    writeFileSync(p, generateMarkdownReport(report), 'utf-8')
-    created.push(p)
-    console.log(`[i18n-hunter] Markdown report: ${p}`)
+    const path = join(outputDir, `${safeFilename}.md`)
+    atomicWriteFile(path, generateMarkdownReport(report), 0o600)
+    created.push(path)
   }
 
   return created
 }
 
-/** Generate a compact summary string for console output. */
-export function generateSummary(report: ExtractionReport): string {
+export function generateSummary(reportInput: ExtractionReport): string {
+  const report = ExtractionReportSchema.parse(reportInput)
   return [
     '=== i18n-hunter — Extraction Summary ===',
-    `Total Files Scanned:    ${report.totalFiles}`,
-    `Total Hardcoded Strings: ${report.totalStrings}`,
+    `Files discovered:      ${report.summary.filesDiscovered}`,
+    `Files scanned:         ${report.summary.filesScanned}`,
+    `Hardcoded strings:     ${report.summary.findings}`,
+    `Scan status:           ${report.complete ? 'complete' : 'incomplete'}`,
     '',
-    'By Category:',
-    `  Labels:        ${report.categorizedResults.labels.length}`,
-    `  Buttons:       ${report.categorizedResults.buttons.length}`,
-    `  Messages:      ${report.categorizedResults.messages.length}`,
-    `  Errors:        ${report.categorizedResults.errors.length}`,
-    `  Notifications: ${report.categorizedResults.notifications.length}`,
+    'By category:',
+    ...findingCategories.map(
+      (category) => `  ${category.padEnd(12)} ${report.summary.categories[category]}`,
+    ),
   ].join('\n')
 }
 
-// ─────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────
-
 function formatResult(result: ScanResult): string {
-  return (
-    `- **${result.filePath}:${result.lineNumber}:${result.columnNumber}**\n` +
-    `  - String: \`${result.hardcodedString}\`\n` +
-    `  - Context: ${result.context}\n` +
-    `  - Suggested Key: \`${result.suggestedKey}\``
+  const value = result.hardcodedString ? inlineCode(result.hardcodedString) : '`[redacted]`'
+  return [
+    `- **${escapeMarkdown(`${result.filePath}:${result.lineNumber}:${result.columnNumber}`)}**`,
+    `  - String: ${value}`,
+    `  - Context: ${inlineCode(result.context)}`,
+    `  - Transform: ${inlineCode(result.transform)}`,
+    `  - Suggested key: ${inlineCode(result.suggestedKey)}`,
+  ].join('\n')
+}
+
+function inlineCode(value: string): string {
+  const singleLine = value.replace(/\r?\n/gu, '↵')
+  const longestRun = Math.max(
+    0,
+    ...Array.from(singleLine.matchAll(/`+/gu), (match) => match[0].length),
   )
+  const fence = '`'.repeat(longestRun + 1)
+  const padding = singleLine.startsWith('`') || singleLine.endsWith('`') ? ' ' : ''
+  const safeValue = escapeHtml(singleLine).replace(/\[/gu, '&#91;').replace(/\]/gu, '&#93;')
+  return `${fence}${padding}${safeValue}${padding}${fence}`
+}
+
+function escapeMarkdown(value: string): string {
+  return escapeHtml(value).replace(/[\\[\]*_~|>]/gu, (character) => `\\${character}`)
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/gu, '&amp;')
+    .replace(/</gu, '&lt;')
+    .replace(/>/gu, '&gt;')
+    .replace(/"/gu, '&quot;')
+    .replace(/'/gu, '&#39;')
+}
+
+function validateFilename(filename: string): string {
+  const normalized = basename(filename)
+  if (!filename || normalized !== filename || normalized === '.' || normalized === '..') {
+    throw new Error('Report filename must be a single safe filename')
+  }
+  return normalized
 }

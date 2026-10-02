@@ -1,62 +1,45 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import * as fs from 'node:fs'
+import { afterEach, describe, expect, it } from 'vitest'
 import { scanForHardcodedStrings } from '../scanner.js'
+import { createTempProject, type TempProject } from './helpers/temp-project.js'
 
-vi.mock('node:fs', () => ({
-  readFileSync: vi.fn(),
-  readdirSync: vi.fn(),
-  lstatSync: vi.fn(),
-  statSync: vi.fn(),
-  existsSync: vi.fn().mockReturnValue(true)
-}))
+let project: TempProject | undefined
 
-describe('scanner', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    vi.mocked(fs.existsSync).mockReturnValue(true)
-    vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => true, isFile: () => false } as any)
-    vi.mocked(fs.lstatSync).mockReturnValue({ isDirectory: () => true, isFile: () => false } as any)
+afterEach(() => project?.cleanup())
+
+describe('scanForHardcodedStrings', () => {
+  it('bounds opaque keys for deeply nested source paths', async () => {
+    project = createTempProject()
+    const path = `${'a'.repeat(60)}/${'b'.repeat(60)}/${'c'.repeat(60)}/App.tsx`
+    project.write(`src/${path}`, 'export const App = () => <div>Long path message</div>')
+
+    const report = await scanForHardcodedStrings({}, project.root)
+
+    expect(report.findings[0]?.suggestedKey.length).toBeLessThanOrEqual(200)
+    expect(report.findings[0]?.valueSha256).toBeUndefined()
   })
 
-  it('detects strings in Vue and React files', () => {
-    // 1. Setup Vue file in src/components
-    vi.mocked(fs.readdirSync).mockImplementation((path: any) => {
-        if (path.toString().includes('components')) return ['App.vue'] as any
-        return [] as any
-    })
-    
-    vi.mocked(fs.statSync).mockImplementation((path: any) => {
-        if (path.toString().endsWith('App.vue')) return { isDirectory: () => false, isFile: () => true } as any
-        return { isDirectory: () => true, isFile: () => false } as any
-    })
+  it('uses opaque source-derived values by default', async () => {
+    project = createTempProject()
+    project.write('src/App.tsx', 'export const App = () => <div>Secret customer label</div>')
 
-    vi.mocked(fs.readFileSync).mockImplementation((path: any) => {
-        if (path.toString().endsWith('.vue')) return '<template><div>Hello Vue</div></template><script>const x = "Vue script"</script>'
-        return ''
-    })
+    const redacted = await scanForHardcodedStrings({}, project.root)
+    const readable = await scanForHardcodedStrings(
+      { includeValues: true, readableKeys: true },
+      project.root,
+    )
 
-    const report = scanForHardcodedStrings({ scanPaths: ['src/components'] }, '/root')
-    
-    expect(report.totalFiles).toBe(1)
-    expect(report.totalStrings).toBe(2)
-    expect(report.results.map(r => r.hardcodedString)).toContain('Hello Vue')
-    expect(report.results.map(r => r.hardcodedString)).toContain('Vue script')
+    expect(redacted.findings[0]?.suggestedKey).not.toContain('secret_customer_label')
+    expect(readable.findings[0]?.suggestedKey).toContain('secret_customer_label')
   })
 
-  it('categorizes results accurately', () => {
-    vi.mocked(fs.readdirSync).mockImplementation((path: any) => {
-        if (path.toString().includes('components')) return ['Btn.tsx'] as any
-        return [] as any
-    })
-    vi.mocked(fs.statSync).mockImplementation((path: any) => {
-        if (path.toString().endsWith('Btn.tsx')) return { isDirectory: () => false, isFile: () => true } as any
-        return { isDirectory: () => true, isFile: () => false } as any
-    })
-    vi.mocked(fs.readFileSync).mockReturnValue('const B = () => <button>Click Me</button>')
+  it('returns a canonical report without console output', async () => {
+    project = createTempProject()
+    project.write('src/App.tsx', 'export const App = () => <div>Hello scanner</div>')
 
-    const report = scanForHardcodedStrings({ scanPaths: ['src/components'] }, '/root')
-    
-    expect(report.categorizedResults.buttons).toHaveLength(1)
-    expect(report.results[0].category).toBe('buttons')
+    const report = await scanForHardcodedStrings({}, project.root)
+
+    expect(report.schemaVersion).toBe(2)
+    expect(report.findings).toHaveLength(1)
+    expect(report.findings[0]?.hardcodedString).toBeUndefined()
   })
 })

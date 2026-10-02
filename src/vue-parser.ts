@@ -1,327 +1,510 @@
-/**
- * Vue Component Parser
- *
- * Parses Vue SFCs using @vue/compiler-sfc and @vue/compiler-dom AST.
- * Exclusively handles .vue files — React/JSX files are handled by react-parser.ts.
- */
+import { parseExpression } from '@babel/parser'
+import { parseJavaScriptSource } from './javascript-extractor.js'
+import { createSourceIndex, trimRange, type SourceIndex } from './source-range.js'
+import type {
+  Diagnostic,
+  ExtractedCandidate,
+  FindingCategory,
+  ParsedVueBlock,
+  ParsedVueComponent,
+  ParseResult,
+} from './types.js'
 
-import { parse } from '@vue/compiler-sfc'
-import {
-  parse as parseTemplate,
-  type ElementNode,
-  type TextNode,
-  type AttributeNode,
-  NodeTypes,
-} from '@vue/compiler-dom'
-import type { ParsedVueComponent } from './types.js'
+interface VueCompiler {
+  parseSfc: (typeof import('@vue/compiler-sfc'))['parse']
+  parseTemplate: (typeof import('@vue/compiler-dom'))['parse']
+  NodeTypes: (typeof import('@vue/compiler-dom'))['NodeTypes']
+}
 
-// ─────────────────────────────────────────────
-// Tag classification maps (Vue-specific tags included)
-// ─────────────────────────────────────────────
+let compilerPromise: Promise<VueCompiler> | undefined
 
-const BUTTON_TAGS = new Set([
-  'button', 'a', 'router-link', 'RouterLink', 'nuxt-link', 'NuxtLink',
-  'el-button', 'v-btn', 'b-button', 'ion-button',
+const userFacingAttributes = new Set([
+  'alt',
+  'aria-label',
+  'label',
+  'placeholder',
+  'title',
+  'tooltip',
 ])
-
-const LABEL_TAGS = new Set([
-  'label', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-  'title', 'th', 'caption', 'legend', 'dt',
+const buttonTags = new Set(['a', 'button', 'nuxt-link', 'router-link', 'el-button'])
+const labelTags = new Set([
+  'caption',
+  'dt',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'label',
+  'legend',
+  'th',
+  'title',
 ])
+const messageTags = new Set(['blockquote', 'dd', 'figcaption', 'li', 'p', 'span', 'summary', 'td'])
 
-const MESSAGE_TAGS = new Set([
-  'p', 'span', 'li', 'td', 'blockquote',
-  'figcaption', 'summary', 'dd',
-])
-
-const LABEL_ATTRS = new Set([
-  'label', 'placeholder', 'title', 'alt', 'tooltip',
-])
-
-// ─────────────────────────────────────────────
-// Public API
-// ─────────────────────────────────────────────
-
-/**
- * Parse a Vue SFC into template, script, and scriptSetup sections.
- * Returns `null` when the file cannot be parsed.
- */
-export function parseVueComponent(content: string, filePath: string): ParsedVueComponent | null {
+export async function parseVueSource(content: string, filePath: string): Promise<ParseResult> {
+  let compiler: VueCompiler
   try {
-    const { descriptor, errors } = parse(content, { filename: filePath })
-
-    if (errors.length > 0) {
-      console.warn(`[i18n-hunter] Parse warnings in ${filePath}:`, errors.map((e) => e.message))
-    }
-
-    const result: ParsedVueComponent = { filePath }
-
-    if (descriptor.template) {
-      result.template = {
-        content: descriptor.template.content,
-        loc: {
-          start: { line: descriptor.template.loc.start.line, column: descriptor.template.loc.start.column },
-          end: { line: descriptor.template.loc.end.line, column: descriptor.template.loc.end.column },
+    compiler = await loadVueCompiler()
+  } catch {
+    return {
+      candidates: [],
+      diagnostics: [
+        {
+          severity: 'error',
+          code: 'E_INVALID_INPUT',
+          message:
+            'Vue scanning requires @vue/compiler-sfc and @vue/compiler-dom. Install the Vue peer dependencies.',
+          filePath,
         },
-      }
+      ],
     }
+  }
 
-    if (descriptor.script) {
-      result.script = {
-        content: descriptor.script.content,
-        loc: {
-          start: { line: descriptor.script.loc.start.line, column: descriptor.script.loc.start.column },
-          end: { line: descriptor.script.loc.end.line, column: descriptor.script.loc.end.column },
-        },
-      }
+  const diagnostics: Diagnostic[] = []
+  let descriptor: ReturnType<VueCompiler['parseSfc']>['descriptor']
+  try {
+    const parsed = compiler.parseSfc(content, { filename: filePath })
+    descriptor = parsed.descriptor
+    if (parsed.errors.length > 0) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'E_PARSE_FAILED',
+        message: parsed.errors
+          .map((error) => error.message)
+          .join('; ')
+          .slice(0, 1000),
+        filePath,
+      })
     }
-
-    if (descriptor.scriptSetup) {
-      result.scriptSetup = {
-        content: descriptor.scriptSetup.content,
-        loc: {
-          start: { line: descriptor.scriptSetup.loc.start.line, column: descriptor.scriptSetup.loc.start.column },
-          end: { line: descriptor.scriptSetup.loc.end.line, column: descriptor.scriptSetup.loc.end.column },
-        },
-      }
-    }
-
-    return result
   } catch (error) {
-    console.error(`[i18n-hunter] Error parsing ${filePath}:`, error)
+    diagnostics.push({
+      severity: 'error',
+      code: 'E_PARSE_FAILED',
+      message: safeMessage(error),
+      filePath,
+    })
+    return { candidates: [], diagnostics }
+  }
+
+  if (diagnostics.some((diagnostic) => diagnostic.code === 'E_PARSE_FAILED')) {
+    return { candidates: [], diagnostics }
+  }
+
+  const candidates: ExtractedCandidate[] = []
+  if (descriptor.template) {
+    candidates.push(
+      ...extractTemplateCandidates(content, descriptor.template, filePath, compiler, diagnostics),
+    )
+  }
+
+  for (const block of [descriptor.script, descriptor.scriptSetup]) {
+    if (!block) continue
+    if (block.src) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'E_UNSUPPORTED_TRANSFORM',
+        message: `External Vue ${block.setup ? 'script setup' : 'script'} blocks are not supported: ${block.src}`,
+        filePath,
+      })
+      continue
+    }
+    const result = parseJavaScriptSource({
+      content: block.content,
+      fullSource: content,
+      filePath,
+      startOffset: block.loc.start.offset,
+      typescript: block.lang === 'ts' || block.lang === 'tsx',
+      jsx: block.lang === 'tsx' || block.lang === 'jsx',
+      componentMode: block.setup ? 'vue-script-setup' : 'vue-script',
+      componentName: componentNameFromFile(filePath),
+    })
+    candidates.push(...result.candidates)
+    diagnostics.push(...result.diagnostics)
+  }
+
+  candidates.sort(
+    (left, right) => left.range.start - right.range.start || left.range.end - right.range.end,
+  )
+  return { candidates, diagnostics }
+}
+
+export async function parseVueComponent(
+  content: string,
+  filePath: string,
+): Promise<ParsedVueComponent | null> {
+  let compiler: VueCompiler
+  try {
+    compiler = await loadVueCompiler()
+  } catch {
+    return null
+  }
+
+  try {
+    const parsed = compiler.parseSfc(content, { filename: filePath })
+    const result: ParsedVueComponent = {
+      filePath,
+      errors: parsed.errors.map((error) => error.message),
+    }
+    if (parsed.descriptor.template) {
+      result.template = toParsedBlock(
+        parsed.descriptor.template.content,
+        parsed.descriptor.template.loc.start.offset,
+        parsed.descriptor.template.lang,
+      )
+    }
+    if (parsed.descriptor.script) {
+      result.script = toParsedBlock(
+        parsed.descriptor.script.content,
+        parsed.descriptor.script.loc.start.offset,
+        parsed.descriptor.script.lang,
+      )
+    }
+    if (parsed.descriptor.scriptSetup) {
+      result.scriptSetup = toParsedBlock(
+        parsed.descriptor.scriptSetup.content,
+        parsed.descriptor.scriptSetup.loc.start.offset,
+        parsed.descriptor.scriptSetup.lang,
+        true,
+      )
+    }
+    return result
+  } catch {
     return null
   }
 }
 
-/**
- * Extract hardcoded strings from a Vue template using @vue/compiler-dom AST.
- * Parent element tags are propagated to each string for accurate categorization.
- * Falls back to regex extraction on parse failure.
- */
-export function extractTemplateStrings(
+export async function extractTemplateStrings(
   template: string,
   startLine: number,
-): Array<{ value: string; line: number; column: number; context: string }> {
-  try {
-    const ast = parseTemplate(template, {
-      comments: false,
-      onError: (err) => console.warn('[i18n-hunter] Template parse warning:', err.message),
-    })
-    const results: Array<{ value: string; line: number; column: number; context: string }> = []
-    walkAST(ast, results, startLine, null)
-    return results
-  } catch {
-    return extractTemplateFallback(template, startLine)
-  }
+  filePath = 'Component.vue',
+): Promise<Array<{ value: string; line: number; column: number; context: string }>> {
+  const compiler = await loadVueCompiler()
+  const diagnostics: Diagnostic[] = []
+  return extractTemplateCandidates(
+    template,
+    { content: template, loc: { start: { offset: 0 } } },
+    filePath,
+    compiler,
+    diagnostics,
+  ).map((candidate) => ({
+    value: candidate.value,
+    line: startLine + candidate.lineNumber - 1,
+    column: candidate.columnNumber,
+    context: candidate.context,
+  }))
 }
 
-/**
- * Extract hardcoded strings from a Vue <script> or <script setup> block.
- * Detects notification calls (toast.success, etc.) for richer context.
- */
-export function extractScriptStrings(
-  script: string,
-  startLine: number,
-): Array<{
-  value: string
-  line: number
-  column: number
-  context: string
-  isNotification?: boolean
-  notificationType?: 'success' | 'error' | 'info' | 'warning'
-}> {
-  const results: Array<{
-    value: string
-    line: number
-    column: number
-    context: string
-    isNotification?: boolean
-    notificationType?: 'success' | 'error' | 'info' | 'warning'
-  }> = []
-
-  const stringPatterns = [
-    /\"([^\"\\]*(\\.[^\"\\]*)*)\"/g,
-    /'([^'\\]*(\\.[^'\\]*)*)'/g,
-    /`([^`\\]*(\\.[^`\\]*)*)`/g,
-  ]
-
-  const lines = script.split('\n')
-
-  lines.forEach((line, index) => {
-    const lineNumber = startLine + index
-    const trimmed = line.trim()
-
-    if (isI18nLine(trimmed)) return
-    if (/console\.(log|error|warn|info|debug|trace)\s*\(/.test(trimmed)) return
-
-    const notifType = getNotificationType(trimmed)
-
-    stringPatterns.forEach((pattern) => {
-      pattern.lastIndex = 0
-      let match: RegExpExecArray | null
-
-      while ((match = pattern.exec(line)) !== null) {
-        const value = match[1]
-        if (!value?.trim() || isTechnical(value, trimmed)) continue
-
-        results.push({
-          value,
-          line: lineNumber,
-          column: match.index + 1,
-          context: notifType ? `notification:${notifType}` : 'script',
-          isNotification: !!notifType,
-          notificationType: notifType ?? undefined,
-        })
-      }
+function extractTemplateCandidates(
+  fullSource: string,
+  block: { content: string; loc: { start: { offset: number } } },
+  filePath: string,
+  compiler: VueCompiler,
+  diagnostics: Diagnostic[],
+): ExtractedCandidate[] {
+  const templateErrors: string[] = []
+  let ast
+  try {
+    ast = compiler.parseTemplate(block.content, {
+      comments: false,
+      onError: (error) => templateErrors.push(error.message),
     })
-  })
+  } catch (error) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'E_PARSE_FAILED',
+      message: safeMessage(error),
+      filePath,
+    })
+    return []
+  }
 
+  if (templateErrors.length > 0) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'E_PARSE_FAILED',
+      message: templateErrors.join('; ').slice(0, 1000),
+      filePath,
+    })
+    return []
+  }
+
+  const results: ExtractedCandidate[] = []
+  const lineIndex = createSourceIndex(fullSource)
+  walkTemplate(
+    ast,
+    block.loc.start.offset,
+    fullSource,
+    filePath,
+    null,
+    compiler,
+    results,
+    diagnostics,
+    lineIndex,
+  )
   return results
 }
 
-// ─────────────────────────────────────────────
-// Internal — context resolution
-// ─────────────────────────────────────────────
-
-function resolveContext(parentTag: string | null, attrName?: string): string {
-  if (attrName) {
-    return LABEL_ATTRS.has(attrName)
-      ? `attribute:${attrName}:label`
-      : `attribute:${attrName}`
-  }
-  if (!parentTag) return 'text-node'
-  const tag = parentTag.toLowerCase()
-  if (BUTTON_TAGS.has(parentTag) || BUTTON_TAGS.has(tag)) return 'tag:button'
-  if (LABEL_TAGS.has(tag)) return 'tag:label'
-  if (MESSAGE_TAGS.has(tag)) return 'tag:message'
-  return `tag:${tag}`
-}
-
-// ─────────────────────────────────────────────
-// Internal — AST walker
-// ─────────────────────────────────────────────
-
-const SKIP_ATTRS = new Set([
-  'class', 'id', 'style', 'type', 'name', 'for', 'role',
-  'key', 'ref', 'is', 'slot', 'slot-scope',
-  'size', 'variant', 'color', 'icon', 'loading', 'disabled',
-  'href', 'to', 'target', 'rel', 'method', 'action',
-])
-const SKIP_PREFIXES = ['data-', 'aria-', '@', ':', 'v-', '#']
-
-function shouldSkip(attrName: string): boolean {
-  return SKIP_ATTRS.has(attrName) || SKIP_PREFIXES.some((p) => attrName.startsWith(p))
-}
-
-function walkAST(
+function walkTemplate(
   node: any,
-  results: Array<{ value: string; line: number; column: number; context: string }>,
-  startLine: number,
+  blockStart: number,
+  fullSource: string,
+  filePath: string,
   parentTag: string | null,
+  compiler: VueCompiler,
+  results: ExtractedCandidate[],
+  diagnostics: Diagnostic[],
+  lineIndex: SourceIndex,
 ): void {
   if (!node) return
 
-  if (node.type === NodeTypes.TEXT) {
-    const text = node as TextNode
-    const value = text.content.trim()
-    if (value && !isI18nLine(value)) {
-      results.push({
-        value,
-        line: startLine + (text.loc?.start.line ?? 1) - 1,
-        column: text.loc?.start.column ?? 0,
-        context: resolveContext(parentTag),
-      })
-    }
+  if (node.type === compiler.NodeTypes.TEXT) {
+    addTextCandidate(node, blockStart, fullSource, filePath, parentTag, results, lineIndex)
     return
   }
+  if (node.type === compiler.NodeTypes.INTERPOLATION) return
 
-  if (node.type === NodeTypes.INTERPOLATION) return
-
-  if (node.type === NodeTypes.ELEMENT) {
-    const el = node as ElementNode
-    const tag = el.tag ?? null
-
-    for (const prop of el.props ?? []) {
-      if (prop.type !== NodeTypes.ATTRIBUTE) continue
-      const attr = prop as AttributeNode
-      if (!attr.value?.content || shouldSkip(attr.name)) continue
-
-      const value = attr.value.content.trim()
-      if (value && !isI18nLine(value)) {
-        results.push({
-          value,
-          line: startLine + (attr.loc?.start.line ?? 1) - 1,
-          column: attr.loc?.start.column ?? 0,
-          context: resolveContext(tag, attr.name),
-        })
+  if (node.type === compiler.NodeTypes.ELEMENT) {
+    const tag = typeof node.tag === 'string' ? node.tag : null
+    for (const property of node.props ?? []) {
+      if (property.type === compiler.NodeTypes.ATTRIBUTE) {
+        addAttributeCandidate(property, blockStart, fullSource, filePath, results, lineIndex)
+      } else if (property.type === compiler.NodeTypes.DIRECTIVE) {
+        addDirectiveCandidate(
+          property,
+          blockStart,
+          fullSource,
+          filePath,
+          results,
+          diagnostics,
+          lineIndex,
+        )
       }
     }
-
-    for (const child of el.children ?? []) {
-      walkAST(child, results, startLine, tag)
+    for (const child of node.children ?? []) {
+      walkTemplate(
+        child,
+        blockStart,
+        fullSource,
+        filePath,
+        tag,
+        compiler,
+        results,
+        diagnostics,
+        lineIndex,
+      )
     }
     return
   }
 
   for (const child of node.children ?? []) {
-    walkAST(child, results, startLine, parentTag)
+    walkTemplate(
+      child,
+      blockStart,
+      fullSource,
+      filePath,
+      parentTag,
+      compiler,
+      results,
+      diagnostics,
+      lineIndex,
+    )
   }
 }
 
-// ─────────────────────────────────────────────
-// Internal — fallback (regex-based)
-// ─────────────────────────────────────────────
-
-function extractTemplateFallback(
-  template: string,
-  startLine: number,
-): Array<{ value: string; line: number; column: number; context: string }> {
-  const results: Array<{ value: string; line: number; column: number; context: string }> = []
-  template.split('\n').forEach((line, i) => {
-    const lineNumber = startLine + i
-    const textRe = />([^<>]+)</g
-    const attrRe = /(\w+)\s*=\s*["']([^"']+)["']/g
-    let m: RegExpExecArray | null
-
-    while ((m = textRe.exec(line)) !== null) {
-      const value = m[1]?.trim()
-      if (value && !value.startsWith('{{') && !isI18nLine(value)) {
-        results.push({ value, line: lineNumber, column: m.index + 1, context: 'text-node' })
-      }
-    }
-
-    while ((m = attrRe.exec(line)) !== null) {
-      const name = m[1]
-      const value = m[2]?.trim()
-      if (!shouldSkip(name) && value && !isI18nLine(value)) {
-        results.push({ value, line: lineNumber, column: m.index + 1, context: `attribute:${name}` })
-      }
-    }
-  })
-  return results
+function addTextCandidate(
+  node: any,
+  blockStart: number,
+  fullSource: string,
+  filePath: string,
+  parentTag: string | null,
+  results: ExtractedCandidate[],
+  lineIndex: SourceIndex,
+): void {
+  const raw = node.loc?.source ?? ''
+  const trimmed = trimRange(raw)
+  const value = (node.content ?? raw).trim()
+  if (!trimmed || !/[\p{L}\p{N}]/u.test(value)) return
+  const range = {
+    start: blockStart + node.loc.start.offset + trimmed.leading,
+    end: blockStart + node.loc.start.offset + trimmed.leading + trimmed.value.length,
+  }
+  const context = parentTag ? `tag:${parentTag.toLowerCase()}` : 'text-node'
+  results.push(
+    createCandidate({
+      value,
+      raw: fullSource.slice(range.start, range.end),
+      range,
+      fullSource,
+      lineIndex,
+      filePath,
+      context,
+      category: categoryForTag(parentTag, value),
+      transform: 'vue-template-text',
+    }),
+  )
 }
 
-// ─────────────────────────────────────────────
-// Internal — filters
-// ─────────────────────────────────────────────
-
-function isI18nLine(text: string): boolean {
-  return [/\$t\s*\(/, /\bt\s*\(/, /v-t\s*=/, /\{\{\s*\$t\s*\(/, /\{\{\s*t\s*\(/]
-    .some((p) => p.test(text))
+function addAttributeCandidate(
+  node: any,
+  blockStart: number,
+  fullSource: string,
+  filePath: string,
+  results: ExtractedCandidate[],
+  lineIndex: SourceIndex,
+): void {
+  if (!userFacingAttributes.has(node.name) || !node.value?.loc) return
+  const raw = node.value.loc.source as string
+  const quote = raw[0]
+  const valueRaw = quote === '"' || quote === "'" ? raw.slice(1, -1) : raw
+  const value = typeof node.value.content === 'string' ? node.value.content : valueRaw
+  if (!/[\p{L}\p{N}]/u.test(value) || isTechnicalTemplateValue(value)) return
+  const range = {
+    start: blockStart + node.loc.start.offset,
+    end: blockStart + node.loc.end.offset,
+  }
+  results.push(
+    createCandidate({
+      value,
+      raw: fullSource.slice(range.start, range.end),
+      range,
+      fullSource,
+      lineIndex,
+      filePath,
+      context: `attribute:${node.name}`,
+      category: 'label',
+      transform: 'vue-template-attribute',
+    }),
+  )
 }
 
-function isTechnical(value: string, lineCtx: string): boolean {
-  if (!value.trim()) return true
-  if (value.startsWith('/') || /^https?:\/\//.test(value)) return true
-  if (lineCtx.includes('console.')) return true
-  if (/^[a-z][a-zA-Z0-9_]*$/.test(value) && !value.includes(' ')) return true
-  return false
+function addDirectiveCandidate(
+  node: any,
+  blockStart: number,
+  fullSource: string,
+  filePath: string,
+  results: ExtractedCandidate[],
+  diagnostics: Diagnostic[],
+  lineIndex: SourceIndex,
+): void {
+  const expressionSource = node.exp?.loc?.source
+  if (!expressionSource) return
+  try {
+    const expression = parseExpression(expressionSource, { plugins: ['typescript'] })
+    if (expression.type !== 'StringLiteral') return
+    const start = blockStart + node.exp.loc.start.offset + expression.start
+    const end = blockStart + node.exp.loc.start.offset + expression.end
+    const value = expression.value
+    if (!/[\p{L}\p{N}]/u.test(value)) return
+    const directiveSource = fullSource.slice(
+      blockStart + node.loc.start.offset,
+      blockStart + node.loc.end.offset,
+    )
+    const argument =
+      typeof node.arg?.loc?.source === 'string' ? node.arg.loc.source.trim() : undefined
+    const isVText = directiveSource.includes('v-text')
+    if (!isVText && (!argument || !userFacingAttributes.has(argument))) return
+    if (isTechnicalTemplateValue(value)) return
+    const context = isVText
+      ? 'directive:v-text'
+      : argument
+        ? `attribute:${argument}`
+        : `directive:${node.name}`
+    results.push(
+      createCandidate({
+        value,
+        raw: fullSource.slice(start, end),
+        range: { start, end },
+        fullSource,
+        lineIndex,
+        filePath,
+        context,
+        category: 'label',
+        transform: 'vue-template-attribute',
+      }),
+    )
+  } catch (error) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: safeMessage(error),
+      filePath,
+    })
+  }
 }
 
-function getNotificationType(line: string): 'success' | 'error' | 'info' | 'warning' | null {
-  if (/toast\.success\s*\(/.test(line)) return 'success'
-  if (/toast\.error\s*\(/.test(line)) return 'error'
-  if (/toast\.info\s*\(/.test(line)) return 'info'
-  if (/toast\.warn(ing)?\s*\(/.test(line)) return 'warning'
-  return null
+function createCandidate(input: {
+  value: string
+  raw: string
+  range: { start: number; end: number }
+  fullSource: string
+  lineIndex: SourceIndex
+  filePath: string
+  context: string
+  category: FindingCategory
+  transform: 'vue-template-text' | 'vue-template-attribute'
+}): ExtractedCandidate {
+  const start = input.lineIndex.positionAt(input.range.start)
+  const end = input.lineIndex.positionAt(input.range.end)
+  return {
+    value: input.value,
+    raw: input.raw,
+    range: input.range,
+    lineNumber: start.line,
+    columnNumber: start.column,
+    endLineNumber: end.line,
+    endColumnNumber: end.column,
+    context: input.context,
+    category: input.category,
+    transform: input.transform,
+  }
+}
+
+function categoryForTag(tag: string | null, value: string): FindingCategory {
+  if (!tag) return 'message'
+  const normalized = tag.toLowerCase()
+  if (buttonTags.has(normalized) || buttonTags.has(tag)) return 'button'
+  if (labelTags.has(normalized)) return 'label'
+  if (messageTags.has(normalized)) return 'message'
+  if (/(error|failed|invalid)/iu.test(value)) return 'error'
+  return 'label'
+}
+
+function toParsedBlock(
+  content: string,
+  start: number,
+  lang?: string,
+  setup = false,
+): ParsedVueBlock {
+  return { content, start, end: start + content.length, lang, setup }
+}
+
+function componentNameFromFile(filePath: string): string {
+  const name =
+    filePath
+      .split('/')
+      .at(-1)
+      ?.replace(/\.[^.]+$/u, '') ?? 'Component'
+  const safe = /^[A-Z]/u.test(name) ? name : 'Component'
+  return safe.slice(0, 100)
+}
+
+function isTechnicalTemplateValue(value: string): boolean {
+  return /^(?:https?:\/\/|data:|application\/|text\/|\/|\.{0,2}\/|[A-Za-z]:\\)/iu.test(value.trim())
+}
+
+async function loadVueCompiler(): Promise<VueCompiler> {
+  compilerPromise ??= Promise.all([import('@vue/compiler-sfc'), import('@vue/compiler-dom')]).then(
+    ([sfc, dom]) => ({
+      parseSfc: sfc.parse,
+      parseTemplate: dom.parse,
+      NodeTypes: dom.NodeTypes,
+    }),
+  )
+  return compilerPromise
+}
+
+function safeMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 1000)
 }

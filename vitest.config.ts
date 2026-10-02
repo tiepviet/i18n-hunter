@@ -2,7 +2,6 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   resolve: {
-    // Strip .js from relative imports so Vite can resolve .ts source files
     alias: [{ find: /^(\.+\/.+)\.js$/, replacement: '$1' }],
   },
   test: {
@@ -12,7 +11,14 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
-      exclude: ['**/node_modules/**', '**/dist/**', 'src/cli.ts'],
+      include: ['src/**/*.ts'],
+      exclude: ['src/__tests__/**', 'src/types.ts', 'src/index.ts', 'src/cli.ts', 'src/version.ts'],
+      thresholds: {
+        statements: 80,
+        branches: 70,
+        functions: 80,
+        lines: 80,
+      },
     },
   },
 })

@@ -1,20 +1,18 @@
 <template>
-  <div class="user-card">
-    <h2>User Information</h2>
+  <main class="user-card">
+    <h1>User Information</h1>
     <p>Welcome to our system. Please manage your profile below.</p>
-    
-    <div class="actions">
-      <button @click="save">Save Changes</button>
-      <button class="btn-cancel">Cancel Operation</button>
-    </div>
-
-    <span v-if="hasError" class="error-msg">You must enter a username before proceeding.</span>
-  </div>
+    <button type="button" @click="save">Save Changes</button>
+    <button type="button">Cancel Operation</button>
+  </main>
 </template>
 
-<script setup>
+<script setup lang="ts">
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
+
 const save = () => {
-  console.log("Save button clicked");
-  alert("Your data has been submitted successfully!");
+  window.alert(t('feedback.saved'))
 }
 </script>

@@ -1,73 +1,29 @@
-import { describe, it, expect } from 'vitest'
-import { generateMarkdownReport, generateJsonReport, generateSummary } from '../report-formatter.js'
-import type { ExtractionReport } from '../types.js'
+import { afterEach, describe, expect, it } from 'vitest'
+import { exportReport, generateJsonReport, generateSummary } from '../report-formatter.js'
+import { createReport } from './helpers/report-fixtures.js'
+import { createTempProject, type TempProject } from './helpers/temp-project.js'
 
-const makeReport = (): ExtractionReport => ({
-  totalFiles: 5,
-  totalStrings: 3,
-  results: [
-    {
-      filePath: 'src/components/Foo.vue',
-      lineNumber: 10,
-      columnNumber: 3,
-      hardcodedString: 'Save',
-      context: 'template',
-      suggestedKey: 'common.actions.save',
-      category: 'button',
-    },
-  ],
-  categorizedResults: {
-    labels: [],
-    buttons: [
-      {
-        filePath: 'src/components/Foo.vue',
-        lineNumber: 10,
-        columnNumber: 3,
-        hardcodedString: 'Save',
-        context: 'template',
-        suggestedKey: 'common.actions.save',
-        category: 'button',
-      },
-    ],
-    messages: [],
-    errors: [],
-    notifications: [],
-  },
-})
+let project: TempProject | undefined
 
-describe('generateMarkdownReport', () => {
-  it('contains report header', () => {
-    const md = generateMarkdownReport(makeReport())
-    expect(md).toContain('# i18n-hunter Hunt Report')
+afterEach(() => project?.cleanup())
+
+describe('report formatter', () => {
+  it('generates valid canonical JSON and a truthful summary', () => {
+    const report = createReport()
+    const parsed = JSON.parse(generateJsonReport(report))
+    expect(parsed.schemaVersion).toBe(2)
+    expect(generateSummary(report)).toContain('Hardcoded strings:     1')
   })
 
-  it('contains file count', () => {
-    const md = generateMarkdownReport(makeReport())
-    expect(md).toContain('5')
-  })
-
-  it('contains suggested key', () => {
-    const md = generateMarkdownReport(makeReport())
-    expect(md).toContain('common.actions.save')
-  })
-})
-
-describe('generateJsonReport', () => {
-  it('is valid JSON', () => {
-    const json = generateJsonReport(makeReport())
-    expect(() => JSON.parse(json)).not.toThrow()
-  })
-
-  it('includes totalFiles', () => {
-    const parsed = JSON.parse(generateJsonReport(makeReport()))
-    expect(parsed.totalFiles).toBe(5)
-  })
-})
-
-describe('generateSummary', () => {
-  it('contains button count', () => {
-    const summary = generateSummary(makeReport())
-    expect(summary).toContain('Buttons:')
-    expect(summary).toContain('1')
+  it('exports only safe report filenames', () => {
+    project = createTempProject()
+    expect(() =>
+      exportReport(createReport(), {
+        outputDir: project!.root,
+        filename: '../escape',
+        json: true,
+        markdown: false,
+      }),
+    ).toThrow(/filename/i)
   })
 })

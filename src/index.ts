@@ -1,50 +1,58 @@
-/**
- * i18n-hunter
- *
- * Universal scanner for hardcoded strings in Vue and React projects.
- *
- * @module i18n-hunter
- * @license MIT
- */
-
-// ── Types ──────────────────────────────────────
 export type {
-  ScanResult,
   CategorizedResults,
+  ComponentContext,
+  Diagnostic,
+  DiagnosticSeverity,
+  ExtractedCandidate,
   ExtractionReport,
-  ScannerConfig,
+  FindingCategory,
+  NotificationType,
+  ParseResult,
+  ParsedVueBlock,
   ParsedVueComponent,
+  ScanLimits,
+  ScanResult,
+  ScannerConfig,
+  SourceRange,
+  TransformKind,
 } from './types.js'
+export { findingCategories, transformKinds } from './types.js'
 
-// ── Configuration ──────────────────────────────
-export { defaultScannerConfig, exclusionPatterns, categorizationPatterns } from './config.js'
+export { createScannerConfig, defaultScannerConfig } from './config.js'
+export { HunterError } from './errors.js'
+export {
+  canonicalizeRoot,
+  isPathInside,
+  resolveContainedPath,
+  resolveContainedSourcePath,
+  sourceExtensions,
+  validatePortableRelativePath,
+} from './path-policy.js'
+export { defaultScanLimits, resolveScanLimits } from './limits.js'
+export { discoverSourceFiles } from './discovery.js'
+export type { DiscoveryOptions, DiscoveryResult } from './discovery.js'
+export { matchesPattern, findFiles, getAllFiles } from './file-utils.js'
+export { generateSmartKey } from './key-generator.js'
+export { hashText, positionAt } from './source-range.js'
 
-// ── File utilities ─────────────────────────────
-export { matchesPattern, findFiles, readFile, getAllFiles } from './file-utils.js'
+export { ExtractionReportSchema, DiagnosticSchema, parseExtractionReport } from './report-schema.js'
+export { ManifestSchema, parseManifest } from './manifest-schema.js'
+export { readJsonBounded } from './safe-json.js'
 
-// ── Vue parser (@vue/compiler-dom AST) ─────────
-export { parseVueComponent, extractTemplateStrings, extractScriptStrings } from './vue-parser.js'
-
-// ── React parser (@babel/parser AST) ──────────
-export type { ExtractedString } from './react-parser.js'
-export { parseReactComponent } from './react-parser.js'
-
-// ── Main scanner (orchestrator) ────────────────
+export { parseReactSource, parseReactComponent } from './react-parser.js'
+export { parseVueSource, parseVueComponent, extractTemplateStrings } from './vue-parser.js'
 export { scanForHardcodedStrings } from './scanner.js'
-
-// ── Apply / Rollback ──────────────────────────
-export { applyReport, rollbackFromManifest, cleanBackups } from './applier.js'
-export type { ApplyOptions, ApplyResult } from './applier.js'
-
-// ── Sync ─────────────────────────────────────
+export { createFileTransformPlan } from './transform.js'
+export type { TransformPlan } from './transform.js'
+export { applyReport, rollbackTransactions, cleanTransactions } from './applier.js'
+export type { ApplyOptions, ApplyResult, RollbackResult, CleanResult } from './applier.js'
 export { syncReportMd } from './sync-report.js'
 export type { SyncResult } from './sync-report.js'
-
-// ── Reporting ──────────────────────────────────
 export {
-  generateMarkdownReport,
-  generateJsonReport,
+  categorizeFindings,
   exportReport,
+  generateJsonReport,
+  generateMarkdownReport,
   generateSummary,
 } from './report-formatter.js'
 export type { ExportOptions } from './report-formatter.js'

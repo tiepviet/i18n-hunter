@@ -1,6 +1,6 @@
 {
   "name": "i18n-hunter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hunt down every hardcoded string in your Vue/React project and automate your i18n workflow.",
   "keywords": [
     "i18n",
@@ -28,12 +28,20 @@
     "url": "https://github.com/tiepviet"
   },
   "type": "module",
+  "packageManager": "npm@10.8.2",
+  "sideEffects": false,
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -43,18 +51,27 @@
   },
   "files": [
     "dist",
+    "docs",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "lint": "eslint src --ext .ts",
-    "format": "prettier --write src/**/*.ts",
-    "prepublishOnly": "npm run build && npm run test"
+    "test:cli": "npm run build && node scripts/cli-smoke.mjs",
+    "test:package": "npm run build && node scripts/package-smoke.mjs",
+    "lint": "eslint src scripts '*.ts'",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:cli && npm run test:package && npm audit --omit=dev --audit-level=high",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
     "@vue/compiler-dom": "^3.0.0",
@@ -69,20 +86,40 @@
     }
   },
   "devDependencies": {
-    "@babel/parser": "^7.29.2",
-    "@babel/types": "^7.29.0",
-    "@types/node": "^20.14.10",
-    "@vitest/coverage-v8": "^2.1.9",
-    "@vue/compiler-dom": "^3.5.0",
-    "@vue/compiler-sfc": "^3.5.0",
-    "tsup": "^8.1.0",
-    "typescript": "^5.5.3",
-    "vitest": "^2.0.1"
+    "@eslint/js": "10.0.1",
+    "@types/babel__generator": "7.27.0",
+    "@types/babel__traverse": "7.28.0",
+    "@types/node": "22.18.12",
+    "@types/picomatch": "4.0.3",
+    "@vitest/coverage-v8": "4.1.11",
+    "@vue/compiler-dom": "3.5.43",
+    "@vue/compiler-sfc": "3.5.43",
+    "esbuild": "0.28.2",
+    "eslint": "10.11.0",
+    "globals": "17.12.0",
+    "prettier": "3.9.9",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.1",
+    "vitest": "4.1.11"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.19.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.2"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@babel/generator": "7.29.8",
+    "@babel/parser": "7.29.9",
+    "@babel/traverse": "7.29.8",
+    "@babel/types": "7.29.8",
+    "diff": "9.0.0",
+    "picomatch": "4.0.7",
+    "tinyglobby": "0.2.17",
+    "zod": "4.6.5"
   }
 }

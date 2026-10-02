@@ -1,19 +1,33 @@
-import { describe, it, expect } from 'vitest'
-import { defaultScannerConfig, categorizationPatterns } from '../config.js'
+import { describe, expect, it } from 'vitest'
+import { createScannerConfig, defaultScannerConfig } from '../config.js'
 
-describe('config', () => {
-  it('has default scan paths', () => {
-    expect(defaultScannerConfig.scanPaths).toContain('src/components')
-    expect(defaultScannerConfig.scanPaths).toContain('src/pages')
+describe('scanner config', () => {
+  it('defaults to the documented src root and redacts values', () => {
+    expect(defaultScannerConfig.scanPaths).toEqual(['src'])
+    expect(defaultScannerConfig.includeValues).toBe(false)
   })
 
-  it('has exclusion patterns for node_modules and tests', () => {
-    expect(defaultScannerConfig.excludePatterns).toContain('**/node_modules/**')
-    expect(defaultScannerConfig.excludePatterns).toContain('**/*.test.ts')
+  it('excludes dependencies, generated output, tests, and managed state', () => {
+    expect(defaultScannerConfig.excludePatterns).toEqual(
+      expect.arrayContaining([
+        '**/node_modules/**',
+        '**/dist/**',
+        '**/*.test.*',
+        '**/__tests__/**',
+        '**/.i18n-hunter/**',
+      ]),
+    )
   })
 
-  it('has categorization patterns for buttons and errors', () => {
-    expect(categorizationPatterns.button).toBeDefined()
-    expect(categorizationPatterns.error).toBeDefined()
+  it('creates independent immutable-by-copy configuration', () => {
+    const config = createScannerConfig({ scanPaths: ['app'], includeValues: true })
+    config.scanPaths.push('other')
+    expect(defaultScannerConfig.scanPaths).toEqual(['src'])
+    expect(config.includeValues).toBe(true)
+  })
+
+  it('propagates stateDir, which discovery relies on to exclude managed state', () => {
+    expect(createScannerConfig({ stateDir: 'hunter-state' }).stateDir).toBe('hunter-state')
+    expect(createScannerConfig({}).stateDir).toBeUndefined()
   })
 })

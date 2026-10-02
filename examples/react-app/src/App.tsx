@@ -1,25 +1,16 @@
-import React from 'react';
 import { useTranslation } from 'react-i18next'
 
-export const Header = () => {
+export const App = () => {
   const { t } = useTranslation()
-  return (
-    <header className="main-header">
-      <nav>
-        <ul>
-          <li>{t('common.msg.home')}</li>
-          <li>{t('common.msg.our_services')}</li>
-          <li>{t('common.msg.contact_us')}</li>
-        </ul>
-      </nav>
-      
-      <div class="user-menu">
-        <button label={t('common.lbl.logout')}>{t('common.btn.exit_system')}</button>
-      </div>
 
-      <div class="alert shadow">
-        <strong>{t('common.lbl.warning')}</strong> {t('common.msg.you_are_currently_us')}
-      </div>
-    </header>
-  );
-};
+  return (
+    <main className="user-card">
+      <h1>User Information</h1>
+      <p>Welcome to our system. Please manage your profile below.</p>
+      <button type="button" onClick={() => console.info(t('feedback.saved'))}>
+        Save Changes
+      </button>
+      <button type="button">Cancel Operation</button>
+    </main>
+  )
+}
