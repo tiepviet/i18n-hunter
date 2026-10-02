@@ -89,9 +89,9 @@
     "@eslint/js": "10.0.1",
     "@types/babel__generator": "7.27.0",
     "@types/babel__traverse": "7.28.0",
-    "@types/node": "22.18.12",
+    "@types/node": "26.6.3",
     "@types/picomatch": "4.0.3",
-    "@vitest/coverage-v8": "4.1.11",
+    "@vitest/coverage-v8": "5.0.2",
     "@vue/compiler-dom": "3.5.43",
     "@vue/compiler-sfc": "3.5.43",
     "esbuild": "0.28.2",
@@ -99,8 +99,8 @@
     "globals": "17.12.0",
     "prettier": "3.9.9",
     "tsup": "8.5.1",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.70.1",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.71.0",
     "vitest": "4.1.11"
   },
   "engines": {
