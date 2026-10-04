@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, rmdirSync } from 'node:fs'
 import { atomicWriteFile, sanitizeFileMode } from './atomic-write.js'
 import { resolveStateRelativePath } from './discovery.js'
-import { HunterError, errorMessage } from './errors.js'
+import { HunterError, safeMessage } from './errors.js'
 import { scanLimitCeilings } from './limits.js'
 import type { Manifest } from './manifest-schema.js'
 import { canonicalizeRoot, resolveContainedSourcePath } from './path-policy.js'
@@ -143,14 +143,33 @@ export async function applyReport(reportPath: string, options: ApplyOptions): Pr
     return { modifiedFiles: [], skipped: [...grouped.keys()], diffs: [], diagnostics: [] }
   }
 
-  const diffs = preflight.map(({ filePath, originalContent, plan }) =>
-    createTwoFilesPatch(filePath, filePath, originalContent, plan.content, '', '', {
-      context: 3,
-    }).replace(
-      `--- ${filePath}\n+++ ${filePath}\n`,
-      () => `--- a/${filePath}\n+++ b/${filePath}\n`,
-    ),
+  // Diff strings hold ~2x file content in memory (old + new + patch overhead).
+  // Cap total diff bytes to avoid OOM on large preflight sets: above
+  // MAX_PREFLIGHT_DIFF_BYTES emit a per-file placeholder instead of the full
+  // unified patch. Dry-run still returns the full modified-file list fail-closed.
+  const MAX_PREFLIGHT_DIFF_BYTES = 5_000_000
+  const preflightBytes = preflight.reduce(
+    (sum, item) =>
+      sum +
+      Buffer.byteLength(item.originalContent, 'utf8') +
+      Buffer.byteLength(item.plan.content, 'utf8'),
+    0,
   )
+  const diffs =
+    preflightBytes > MAX_PREFLIGHT_DIFF_BYTES
+      ? preflight.map(({ filePath, originalContent, plan }) => {
+          const bytes =
+            Buffer.byteLength(originalContent, 'utf8') + Buffer.byteLength(plan.content, 'utf8')
+          return `--- a/${filePath}\n+++ b/${filePath}\n[diff omitted: ${bytes} bytes]\n`
+        })
+      : preflight.map(({ filePath, originalContent, plan }) =>
+          createTwoFilesPatch(filePath, filePath, originalContent, plan.content, '', '', {
+            context: 3,
+          }).replace(
+            `--- ${filePath}\n+++ ${filePath}\n`,
+            () => `--- a/${filePath}\n+++ b/${filePath}\n`,
+          ),
+        )
 
   if (options.dryRun) {
     return {
@@ -531,7 +550,7 @@ function commitTransaction(
     const failureReason = rollbackSucceeded ? error : (rollbackCause ?? error)
     throw new HunterError(
       'E_APPLY_FAILED',
-      `Apply failed and was ${rollbackSucceeded ? 'rolled back' : 'left for recovery'}: ${errorMessage(failureReason)}`,
+      `Apply failed and was ${rollbackSucceeded ? 'rolled back' : 'left for recovery'}: ${safeMessage(failureReason)}`,
     )
   }
 }

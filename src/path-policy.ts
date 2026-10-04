@@ -54,7 +54,10 @@ export function canonicalizeRoot(rootPath: string): string {
   const absolute = resolve(rootPath)
   try {
     return realpathSync.native(absolute)
-  } catch {
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+      throw new HunterError('E_SCAN_PATH_MISSING', `Project root does not exist: ${rootPath}`)
+    }
     throw new HunterError('E_PATH_OUTSIDE_ROOT', `Project root does not exist: ${rootPath}`)
   }
 }

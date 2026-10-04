@@ -46,10 +46,17 @@ const entrySchema = z.strictObject({
   beforeHash: hashSchema,
   afterHash: hashSchema,
   // Restored via fchmod: world-writable/executable modes must never come from a manifest.
-  // Numeric max 0o755 rejects 0o777-class payloads; restore paths additionally
-  // sanitize via sanitizeFileMode (mask to 0o644 subset) for depth-in-depth
-  // against group-writable/executable bits that still pass a numeric max.
-  mode: z.number().int().min(0).max(0o755),
+  // Bitmask refine (not a numeric max): only bits within the 0o644 subset pass
+  // and the owner-readable bit must be set, so 0o755/0o777 are rejected at the
+  // schema. Restore paths additionally sanitize via sanitizeFileMode (mask to
+  // 0o644 subset) for defense-in-depth.
+  mode: z
+    .number()
+    .int()
+    .min(0)
+    .refine((m) => (m & ~0o644) === 0 && (m & 0o400) !== 0, {
+      message: 'Manifest file mode must be within the 0o644 subset and owner-readable',
+    }),
 })
 
 export const ManifestSchema = z
@@ -97,7 +104,7 @@ export function parseManifest(input: unknown): Manifest {
   if (!result.success) {
     throw new HunterError(
       'E_MANIFEST_SCHEMA',
-      `[E_MANIFEST_SCHEMA] ${result.error.issues.map((issue) => issue.message).join('; ')}`,
+      `[E_MANIFEST_SCHEMA] ${formatZodIssues(result.error.issues)}`,
     )
   }
   return result.data
@@ -108,8 +115,16 @@ export function parseLatestTransaction(input: unknown): LatestTransaction {
   if (!result.success) {
     throw new HunterError(
       'E_MANIFEST_SCHEMA',
-      `[E_MANIFEST_SCHEMA] ${result.error.issues.map((issue) => issue.message).join('; ')}`,
+      `[E_MANIFEST_SCHEMA] ${formatZodIssues(result.error.issues)}`,
     )
   }
   return result.data
+}
+
+function formatZodIssues(issues: Array<{ message: string }>): string {
+  const head = issues
+    .slice(0, 5)
+    .map((issue) => issue.message.slice(0, 200))
+    .join('; ')
+  return issues.length > 5 ? `${head}; ... +${issues.length - 5} more` : head
 }

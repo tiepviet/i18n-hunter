@@ -136,8 +136,17 @@ export function discoverSourceFiles(basePath: string, options: DiscoveryOptions)
         })
         continue
       }
-      validatePortableRelativePath(safeScanPath, sourceExtensions)
-      found.add(safeScanPath)
+      try {
+        validatePortableRelativePath(safeScanPath, sourceExtensions)
+        found.add(safeScanPath)
+      } catch (error) {
+        diagnostics.push({
+          severity: 'error',
+          code: error instanceof HunterError ? error.code : 'E_PATH_OUTSIDE_ROOT',
+          message: error instanceof Error ? error.message : String(error),
+          filePath: safeScanPath,
+        })
+      }
       continue
     }
 
@@ -341,9 +350,14 @@ export function resolveStateRelativePath(root: string, stateDir?: string): strin
 }
 
 function normalizeScanPath(path: string): string {
-  if (path === '' || path === '.') return '.'
-  if (path.startsWith('./')) return path.slice(2)
-  return path
+  if (path === '' || path === '.' || path === './') return '.'
+  let normalized = path
+  if (normalized.startsWith('./')) normalized = normalized.slice(2)
+  while (normalized.endsWith('/') && normalized.length > 1) {
+    normalized = normalized.slice(0, -1)
+  }
+  if (normalized === '' || normalized === '.') return '.'
+  return normalized
 }
 
 function escapeGlob(value: string): string {

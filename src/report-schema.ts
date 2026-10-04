@@ -256,8 +256,16 @@ export function parseExtractionReport(input: unknown): ExtractionReport {
   if (!result.success) {
     throw new HunterError(
       'E_REPORT_SCHEMA',
-      `[E_REPORT_SCHEMA] ${result.error.issues.map((issue) => issue.message).join('; ')}`,
+      `[E_REPORT_SCHEMA] ${formatZodIssues(result.error.issues)}`,
     )
   }
   return result.data
+}
+
+function formatZodIssues(issues: Array<{ message: string }>): string {
+  const head = issues
+    .slice(0, 5)
+    .map((issue) => issue.message.slice(0, 200))
+    .join('; ')
+  return issues.length > 5 ? `${head}; ... +${issues.length - 5} more` : head
 }

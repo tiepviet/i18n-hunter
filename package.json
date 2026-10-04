@@ -29,7 +29,10 @@
   },
   "type": "module",
   "packageManager": "npm@10.8.2",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/cli.js",
+    "./dist/cli.cjs"
+  ],
   "exports": {
     ".": {
       "import": {
