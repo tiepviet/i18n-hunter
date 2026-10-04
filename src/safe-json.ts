@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { HunterError } from './errors.js'
 
 export const defaultMaxJsonBytes = 25_000_000
@@ -111,7 +111,12 @@ export function readJsonBounded(path: string, maxBytes = defaultMaxJsonBytes): u
 
   let descriptor: number
   try {
-    descriptor = openSync(path, 'r')
+    // O_NOFOLLOW is unavailable on Windows (constants.O_NOFOLLOW is undefined,
+    // so the fallback 0 silently follows symlinks). The dev/ino comparison
+    // after open is the primary TOCTOU guard on POSIX; on Windows dev/ino are
+    // both 0 so that comparison is vacuous — see the post-open re-lstat below.
+    const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+    descriptor = openSync(path, constants.O_RDONLY | noFollow)
   } catch {
     throw new HunterError('E_JSON_INVALID', `File not found or not readable: ${path}`)
   }
@@ -120,6 +125,17 @@ export function readJsonBounded(path: string, maxBytes = defaultMaxJsonBytes): u
     const stats = fstatSync(descriptor)
     if (!stats.isFile() || stats.dev !== pathStats.dev || stats.ino !== pathStats.ino) {
       throw new HunterError('E_JSON_INVALID', `JSON file changed while opening: ${path}`)
+    }
+    // Windows limitation: dev/ino are both 0, so a symlink swapped in between
+    // the pre-open lstat and open() would still pass the check above.
+    // Re-lstat after open as best-effort mitigation — if the path is currently
+    // a symlink (or no longer a regular file), refuse. This narrows but does
+    // not fully close the TOCTOU window on Windows (see docs/security-model.md).
+    if (stats.dev === 0 && stats.ino === 0) {
+      const fresh = lstatSync(path)
+      if (fresh.isSymbolicLink() || !fresh.isFile()) {
+        throw new HunterError('E_JSON_INVALID', `Expected a regular non-symlink JSON file: ${path}`)
+      }
     }
     if (stats.size > maxBytes)
       throw new HunterError('E_JSON_TOO_LARGE', `JSON file exceeds ${maxBytes} bytes`)

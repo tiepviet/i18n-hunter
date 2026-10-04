@@ -1,4 +1,12 @@
 import { parseExpression } from '@babel/parser'
+import {
+  categoryForTag,
+  isTechnicalValue,
+  isVisibleText,
+  normalizeAttributeName,
+  userFacingAttributes,
+} from './i18n-taxonomy.js'
+import { safeMessage } from './errors.js'
 import { parseJavaScriptSource } from './javascript-extractor.js'
 import { createSourceIndex, trimRange, type SourceIndex } from './source-range.js'
 import type {
@@ -18,30 +26,9 @@ interface VueCompiler {
 
 let compilerPromise: Promise<VueCompiler> | undefined
 
-const userFacingAttributes = new Set([
-  'alt',
-  'aria-label',
-  'label',
-  'placeholder',
-  'title',
-  'tooltip',
-])
-const buttonTags = new Set(['a', 'button', 'nuxt-link', 'router-link', 'el-button'])
-const labelTags = new Set([
-  'caption',
-  'dt',
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'label',
-  'legend',
-  'th',
-  'title',
-])
-const messageTags = new Set(['blockquote', 'dd', 'figcaption', 'li', 'p', 'span', 'summary', 'td'])
+export function __resetVueCompilerForTests(): void {
+  compilerPromise = undefined
+}
 
 export async function parseVueSource(content: string, filePath: string): Promise<ParseResult> {
   let compiler: VueCompiler
@@ -94,9 +81,34 @@ export async function parseVueSource(content: string, filePath: string): Promise
 
   const candidates: ExtractedCandidate[] = []
   if (descriptor.template) {
-    candidates.push(
-      ...extractTemplateCandidates(content, descriptor.template, filePath, compiler, diagnostics),
-    )
+    if (descriptor.template.src) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'E_UNSUPPORTED_TRANSFORM',
+        message: `External Vue template blocks are not supported: ${descriptor.template.src}`,
+        filePath,
+      })
+    } else {
+      const lang = (descriptor.template.lang ?? 'html').toLowerCase()
+      if (lang !== 'html' && lang !== '') {
+        diagnostics.push({
+          severity: 'error',
+          code: 'E_PARSE_FAILED',
+          message: `Unsupported Vue template language: ${descriptor.template.lang}`,
+          filePath,
+        })
+      } else {
+        candidates.push(
+          ...extractTemplateCandidates(
+            content,
+            descriptor.template,
+            filePath,
+            compiler,
+            diagnostics,
+          ),
+        )
+      }
+    }
   }
 
   for (const block of [descriptor.script, descriptor.scriptSetup]) {
@@ -110,13 +122,14 @@ export async function parseVueSource(content: string, filePath: string): Promise
       })
       continue
     }
+    const lang = (block.lang ?? 'js').toLowerCase()
     const result = parseJavaScriptSource({
       content: block.content,
       fullSource: content,
       filePath,
       startOffset: block.loc.start.offset,
-      typescript: block.lang === 'ts' || block.lang === 'tsx',
-      jsx: block.lang === 'tsx' || block.lang === 'jsx',
+      typescript: lang === 'ts' || lang === 'tsx' || lang === 'mts' || lang === 'cts',
+      jsx: lang === 'tsx' || lang === 'jsx',
       componentMode: block.setup ? 'vue-script-setup' : 'vue-script',
       componentName: componentNameFromFile(filePath),
     })
@@ -263,7 +276,18 @@ function walkTemplate(
     addTextCandidate(node, blockStart, fullSource, filePath, parentTag, results, lineIndex)
     return
   }
-  if (node.type === compiler.NodeTypes.INTERPOLATION) return
+  if (node.type === compiler.NodeTypes.INTERPOLATION) {
+    addInterpolationCandidate(
+      node,
+      blockStart,
+      fullSource,
+      filePath,
+      results,
+      diagnostics,
+      lineIndex,
+    )
+    return
+  }
 
   if (node.type === compiler.NodeTypes.ELEMENT) {
     const tag = typeof node.tag === 'string' ? node.tag : null
@@ -323,9 +347,13 @@ function addTextCandidate(
   lineIndex: SourceIndex,
 ): void {
   const raw = node.loc?.source ?? ''
+  // Vue decodes entities in `node.content` (`&amp;` → `&`) while `loc.source`
+  // keeps the encoded source. Trim/range must use the raw source so
+  // `fullSource.slice(range.start, range.end)` is the exact raw slice; only
+  // `value` is the decoded text for translation keys/hashes.
   const trimmed = trimRange(raw)
   const value = (node.content ?? raw).trim()
-  if (!trimmed || !/[\p{L}\p{N}]/u.test(value)) return
+  if (!trimmed || !isVisibleText(value)) return
   const range = {
     start: blockStart + node.loc.start.offset + trimmed.leading,
     end: blockStart + node.loc.start.offset + trimmed.leading + trimmed.value.length,
@@ -346,6 +374,96 @@ function addTextCandidate(
   )
 }
 
+function addInterpolationCandidate(
+  node: any,
+  blockStart: number,
+  fullSource: string,
+  filePath: string,
+  results: ExtractedCandidate[],
+  diagnostics: Diagnostic[],
+  lineIndex: SourceIndex,
+): void {
+  // `{{ 'hardcoded' }}` and `{{ cond ? 'a' : 'b' }}` contain extractable literals.
+  const expressionSource: string | undefined = node.content?.loc?.source ?? node.content
+  if (typeof expressionSource !== 'string' || !expressionSource) return
+  let expression: any
+  try {
+    expression = parseExpression(expressionSource, {
+      plugins: ['typescript'],
+    })
+  } catch (error) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: safeMessage(error),
+      filePath,
+    })
+    return
+  }
+  const literals: Array<{ value: string; start: number; end: number }> = []
+  const foundTemplateLiteral = collectStringLiterals(expression, literals)
+  if (foundTemplateLiteral) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: 'Template literals need per-quasi mapping',
+      filePath,
+    })
+  }
+  const baseOffset: number | undefined = node.content?.loc?.start?.offset
+  if (baseOffset === undefined) return
+  for (const literal of literals) {
+    if (!isVisibleText(literal.value) || isTechnicalValue(literal.value)) continue
+    const start = blockStart + baseOffset + literal.start
+    const end = blockStart + baseOffset + literal.end
+    results.push(
+      createCandidate({
+        value: literal.value,
+        raw: fullSource.slice(start, end),
+        range: { start, end },
+        fullSource,
+        lineIndex,
+        filePath,
+        context: 'interpolation:string',
+        category: 'label',
+        transform: 'vue-template-attribute',
+      }),
+    )
+  }
+}
+
+function collectStringLiterals(
+  node: any,
+  out: Array<{ value: string; start: number; end: number }>,
+): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (
+    node.type === 'StringLiteral' &&
+    typeof node.start === 'number' &&
+    typeof node.end === 'number'
+  ) {
+    out.push({ value: node.value, start: node.start, end: node.end })
+    return false
+  }
+  if (node.type === 'TemplateLiteral' && Array.isArray(node.quasis)) {
+    // Template literals in `{{ }}` need per-quasi range mapping that
+    // parseExpression offsets cannot provide safely. Skip with caller-visible
+    // info instead of emitting wrong ranges.
+    return true
+  }
+  let foundTemplate = false
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (collectStringLiterals(item, out)) foundTemplate = true
+      }
+    } else if (value && typeof value === 'object' && 'type' in (value as object)) {
+      if (collectStringLiterals(value, out)) foundTemplate = true
+    }
+  }
+  return foundTemplate
+}
+
 function addAttributeCandidate(
   node: any,
   blockStart: number,
@@ -354,12 +472,15 @@ function addAttributeCandidate(
   results: ExtractedCandidate[],
   lineIndex: SourceIndex,
 ): void {
-  if (!userFacingAttributes.has(node.name) || !node.value?.loc) return
+  const rawName: string | undefined = typeof node.name === 'string' ? node.name : undefined
+  const attributeName: string | undefined =
+    rawName !== undefined ? normalizeAttributeName(rawName) : undefined
+  if (!attributeName || !userFacingAttributes.has(attributeName) || !node.value?.loc) return
   const raw = node.value.loc.source as string
   const quote = raw[0]
   const valueRaw = quote === '"' || quote === "'" ? raw.slice(1, -1) : raw
   const value = typeof node.value.content === 'string' ? node.value.content : valueRaw
-  if (!/[\p{L}\p{N}]/u.test(value) || isTechnicalTemplateValue(value)) return
+  if (!isVisibleText(value) || isTechnicalValue(value)) return
   const range = {
     start: blockStart + node.loc.start.offset,
     end: blockStart + node.loc.end.offset,
@@ -390,40 +511,24 @@ function addDirectiveCandidate(
 ): void {
   const expressionSource = node.exp?.loc?.source
   if (!expressionSource) return
+  // Only `v-text` and user-facing bound attributes (`:placeholder`, `:title`, …)
+  // are safe to transform. Dynamic argument bindings (`:[key]`) and non-string
+  // expressions are reported as info, never silently dropped.
+  const directiveName: string = typeof node.name === 'string' ? node.name : ''
+  if (directiveName !== 'bind' && directiveName !== 'text') {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: `Unsupported Vue directive: ${directiveName || 'unknown'}`,
+      filePath,
+    })
+    return
+  }
+  let expression: any
   try {
-    const expression = parseExpression(expressionSource, { plugins: ['typescript'] })
-    if (expression.type !== 'StringLiteral') return
-    const start = blockStart + node.exp.loc.start.offset + expression.start
-    const end = blockStart + node.exp.loc.start.offset + expression.end
-    const value = expression.value
-    if (!/[\p{L}\p{N}]/u.test(value)) return
-    const directiveSource = fullSource.slice(
-      blockStart + node.loc.start.offset,
-      blockStart + node.loc.end.offset,
-    )
-    const argument =
-      typeof node.arg?.loc?.source === 'string' ? node.arg.loc.source.trim() : undefined
-    const isVText = directiveSource.includes('v-text')
-    if (!isVText && (!argument || !userFacingAttributes.has(argument))) return
-    if (isTechnicalTemplateValue(value)) return
-    const context = isVText
-      ? 'directive:v-text'
-      : argument
-        ? `attribute:${argument}`
-        : `directive:${node.name}`
-    results.push(
-      createCandidate({
-        value,
-        raw: fullSource.slice(start, end),
-        range: { start, end },
-        fullSource,
-        lineIndex,
-        filePath,
-        context,
-        category: 'label',
-        transform: 'vue-template-attribute',
-      }),
-    )
+    expression = parseExpression(expressionSource, {
+      plugins: ['typescript'],
+    })
   } catch (error) {
     diagnostics.push({
       severity: 'info',
@@ -431,7 +536,131 @@ function addDirectiveCandidate(
       message: safeMessage(error),
       filePath,
     })
+    return
   }
+  if (expression.type !== 'StringLiteral') {
+    if (
+      expression.type === 'ConditionalExpression' ||
+      expression.type === 'LogicalExpression' ||
+      expression.type === 'SequenceExpression'
+    ) {
+      const rawArgument =
+        typeof node.arg?.loc?.source === 'string' ? node.arg.loc.source.trim() : undefined
+      const normalizedArgument =
+        rawArgument !== undefined ? normalizeAttributeName(rawArgument) : undefined
+      const isConditionalVText = directiveName === 'text'
+      // Dynamic argument bindings like `v-bind:[dynamicKey]` have no static attribute name.
+      if (node.arg?.isStatic === false) {
+        diagnostics.push({
+          severity: 'info',
+          code: 'E_UNSUPPORTED_TRANSFORM',
+          message: 'Unsupported dynamic Vue binding argument',
+          filePath,
+        })
+        return
+      }
+      if (
+        !isConditionalVText &&
+        (!normalizedArgument || !userFacingAttributes.has(normalizedArgument))
+      ) {
+        diagnostics.push({
+          severity: 'info',
+          code: 'E_UNSUPPORTED_TRANSFORM',
+          message: `Unsupported Vue bound attribute: ${normalizedArgument ?? 'dynamic'}`,
+          filePath,
+        })
+        return
+      }
+      const literals: Array<{ value: string; start: number; end: number }> = []
+      const foundTemplateLiteral = collectStringLiterals(expression, literals)
+      if (foundTemplateLiteral) {
+        diagnostics.push({
+          severity: 'info',
+          code: 'E_UNSUPPORTED_TRANSFORM',
+          message: 'Template literals need per-quasi mapping',
+          filePath,
+        })
+      }
+      const baseOffset = blockStart + node.exp.loc.start.offset
+      for (const literal of literals) {
+        if (!isVisibleText(literal.value) || isTechnicalValue(literal.value)) continue
+        const literalStart = baseOffset + literal.start
+        const literalEnd = baseOffset + literal.end
+        const literalContext = isConditionalVText
+          ? 'directive:v-text'
+          : rawArgument
+            ? `attribute:${rawArgument}`
+            : `directive:${node.name}`
+        results.push(
+          createCandidate({
+            value: literal.value,
+            raw: fullSource.slice(literalStart, literalEnd),
+            range: { start: literalStart, end: literalEnd },
+            fullSource,
+            lineIndex,
+            filePath,
+            context: literalContext,
+            category: 'label',
+            transform: 'vue-template-attribute',
+          }),
+        )
+      }
+      return
+    }
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: `Unsupported Vue bound expression: ${expression.type}`,
+      filePath,
+    })
+    return
+  }
+  const start = blockStart + node.exp.loc.start.offset + expression.start
+  const end = blockStart + node.exp.loc.start.offset + expression.end
+  const value = expression.value
+  if (!isVisibleText(value)) return
+  const rawArgument =
+    typeof node.arg?.loc?.source === 'string' ? node.arg.loc.source.trim() : undefined
+  const argument = rawArgument !== undefined ? normalizeAttributeName(rawArgument) : undefined
+  const isVText = directiveName === 'text'
+  // Dynamic argument bindings like `v-bind:[dynamicKey]` have no static attribute name.
+  if (node.arg?.isStatic === false) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: 'Unsupported dynamic Vue binding argument',
+      filePath,
+    })
+    return
+  }
+  if (!isVText && (!argument || !userFacingAttributes.has(argument))) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'E_UNSUPPORTED_TRANSFORM',
+      message: `Unsupported Vue bound attribute: ${argument ?? 'dynamic'}`,
+      filePath,
+    })
+    return
+  }
+  if (isTechnicalValue(value)) return
+  const context = isVText
+    ? 'directive:v-text'
+    : rawArgument
+      ? `attribute:${rawArgument}`
+      : `directive:${node.name}`
+  results.push(
+    createCandidate({
+      value,
+      raw: fullSource.slice(start, end),
+      range: { start, end },
+      fullSource,
+      lineIndex,
+      filePath,
+      context,
+      category: 'label',
+      transform: 'vue-template-attribute',
+    }),
+  )
 }
 
 function createCandidate(input: {
@@ -461,16 +690,6 @@ function createCandidate(input: {
   }
 }
 
-function categoryForTag(tag: string | null, value: string): FindingCategory {
-  if (!tag) return 'message'
-  const normalized = tag.toLowerCase()
-  if (buttonTags.has(normalized) || buttonTags.has(tag)) return 'button'
-  if (labelTags.has(normalized)) return 'label'
-  if (messageTags.has(normalized)) return 'message'
-  if (/(error|failed|invalid)/iu.test(value)) return 'error'
-  return 'label'
-}
-
 function toParsedBlock(
   content: string,
   start: number,
@@ -481,30 +700,31 @@ function toParsedBlock(
 }
 
 function componentNameFromFile(filePath: string): string {
-  const name =
+  const rawName =
     filePath
-      .split('/')
+      .split(/[\\/]/u)
       .at(-1)
       ?.replace(/\.[^.]+$/u, '') ?? 'Component'
-  const safe = /^[A-Z]/u.test(name) ? name : 'Component'
+  // `my-component.vue` → `MyComponent`-style scope; fall back to sanitized name.
+  const pascal = rawName
+    .split(/[-_]+/u)
+    .map((part) => (part ? part[0]!.toUpperCase() + part.slice(1) : ''))
+    .join('')
+  const safe = /^[A-Za-z][A-Za-z0-9]*$/u.test(pascal) ? pascal : 'Component'
   return safe.slice(0, 100)
 }
 
-function isTechnicalTemplateValue(value: string): boolean {
-  return /^(?:https?:\/\/|data:|application\/|text\/|\/|\.{0,2}\/|[A-Za-z]:\\)/iu.test(value.trim())
-}
-
 async function loadVueCompiler(): Promise<VueCompiler> {
-  compilerPromise ??= Promise.all([import('@vue/compiler-sfc'), import('@vue/compiler-dom')]).then(
-    ([sfc, dom]) => ({
+  compilerPromise ??= Promise.all([import('@vue/compiler-sfc'), import('@vue/compiler-dom')])
+    .then(([sfc, dom]) => ({
       parseSfc: sfc.parse,
       parseTemplate: dom.parse,
       NodeTypes: dom.NodeTypes,
-    }),
-  )
+    }))
+    .catch((error: unknown) => {
+      // A failed optional-peer import must not poison later scans (e.g. after install).
+      compilerPromise = undefined
+      throw error
+    })
   return compilerPromise
-}
-
-function safeMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 1000)
 }

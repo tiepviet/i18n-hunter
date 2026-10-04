@@ -53,8 +53,8 @@ Result:
 - Prettier check: PASS
 - ESLint: PASS
 - TypeScript: PASS
-- Vitest: 19 files, 116 tests PASS
-- Coverage: 83.20% statements, 73.35% branches, 90.44% functions, 86.57% lines
+- Vitest: 29 files, 197 tests PASS (re-baselined 2026-10-04)
+- Coverage: 80.39% statements, 71.01% branches, 87.25% functions, 83.82% lines (re-baselined 2026-10-04)
 - CLI subprocess smoke: PASS
 - Packed-package smoke: PASS
 - Production dependency audit: 0 vulnerabilities
@@ -74,6 +74,8 @@ Result:
 ### Example builds
 
 Both example applications were installed and built with Vite:
+
+Example builds are CI-enforced by the blocking `examples` job in `.github/workflows/ci.yml`.
 
 ```text
 examples/react-app: PASS

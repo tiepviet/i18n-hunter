@@ -1,7 +1,9 @@
 import { parse } from '@babel/parser'
 import * as t from '@babel/types'
 import { traverse } from './babel-compat.js'
+import { HunterError } from './errors.js'
 import { parserPlugins } from './javascript-extractor.js'
+import { isJsxSourcePath, isTypeScriptSourcePath } from './path-policy.js'
 import type { TextEdit } from './text-edit.js'
 import type { ComponentContext, ScanResult } from './types.js'
 
@@ -18,13 +20,22 @@ export function planReactBindings(
   const components = uniqueComponents(findings)
   if (components.length === 0) return { bindings: new Map(), edits: [] }
 
-  const ast = parse(content, {
-    sourceType: 'module',
-    plugins: parserPlugins({
-      typescript: filePath.endsWith('.ts') || filePath.endsWith('.tsx'),
-      jsx: ['.js', '.jsx', '.tsx'].some((extension) => filePath.endsWith(extension)),
-    }),
-  })
+  let ast: t.File
+  try {
+    ast = parse(content, {
+      sourceType: 'module',
+      plugins: parserPlugins({
+        typescript: isTypeScriptSourcePath(filePath),
+        jsx: isJsxSourcePath(filePath),
+      }),
+    })
+  } catch (error) {
+    throw new HunterError(
+      'E_PARSE_FAILED',
+      `React binding planning failed to parse: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
+      filePath,
+    )
+  }
   const bindings = new Map<string, string>()
   const hookRanges = new Set<string>()
   const allBindings = collectBindingNames(ast)
@@ -33,7 +44,8 @@ export function planReactBindings(
 
   traverse(ast, {
     ImportDeclaration(path) {
-      if (path.node.source.value !== 'react-i18next') return
+      const source = path.node.source.value
+      if (source !== 'react-i18next' && !source.startsWith('react-i18next/')) return
       for (const specifier of path.node.specifiers) {
         if (
           path.node.importKind !== 'type' &&
@@ -47,29 +59,64 @@ export function planReactBindings(
         }
       }
     },
+  })
+
+  const isHookCallee = (callee: t.Node): boolean => {
+    if (t.isIdentifier(callee, { name: hookCallee })) return true
+    // `React.useTranslation()`, `i18n.useTranslation()` namespaced forms.
+    if (
+      (t.isMemberExpression(callee) || t.isOptionalMemberExpression(callee)) &&
+      !callee.computed &&
+      t.isIdentifier((callee as t.MemberExpression).property, { name: hookCallee })
+    ) {
+      return true
+    }
+    return false
+  }
+
+  traverse(ast, {
     VariableDeclarator(path) {
       const id = path.node.id
-      if ((!t.isIdentifier(id) && !t.isObjectPattern(id)) || !t.isCallExpression(path.node.init))
+      const init = path.node.init
+      if (!init) return
+      // `const { t } = useTranslation()` / `const { t: x } = useTranslation()`.
+      if (t.isCallExpression(init) && isHookCallee(init.callee) && t.isObjectPattern(id)) {
+        const declaration = path.parentPath
+        if (!declaration?.isVariableDeclaration() || typeof declaration.node.start !== 'number')
+          return
+        const declarationStart = declaration.node.start
+        const declarationEnd = declaration.node.end ?? declarationStart
+        const component = components
+          .filter((item) => declarationStart >= item.start && declarationEnd <= item.end)
+          .sort((left, right) => right.start - left.start || left.end - right.end)[0]
+        if (component) {
+          const property = id.properties.find(
+            (item): item is t.ObjectProperty =>
+              t.isObjectProperty(item) && t.isIdentifier(item.key, { name: 't' }),
+          )
+          if (property && t.isIdentifier(property.value))
+            bindings.set(component.id, property.value.name)
+        }
         return
-      if (!t.isIdentifier(path.node.init.callee, { name: hookCallee })) return
-      const declaration = path.parentPath
-      if (!declaration?.isVariableDeclaration() || typeof declaration.node.start !== 'number')
-        return
-      const declarationStart = declaration.node.start
-      const declarationEnd = declaration.node.end ?? declarationStart
-      const containingComponents = components
-        .filter(
-          (component) => declarationStart >= component.start && declarationEnd <= component.end,
-        )
-        .sort((left, right) => right.start - left.start || left.end - right.end)
-      const component = containingComponents[0]
-      if (component && t.isObjectPattern(id)) {
-        const property = id.properties.find(
-          (item): item is t.ObjectProperty =>
-            t.isObjectProperty(item) && t.isIdentifier(item.key, { name: 't' }),
-        )
-        if (property && t.isIdentifier(property.value))
-          bindings.set(component.id, property.value.name)
+      }
+      // `const t = useTranslation().t` — member form.
+      if (
+        t.isIdentifier(id) &&
+        t.isMemberExpression(init) &&
+        !init.computed &&
+        t.isIdentifier(init.property, { name: 't' }) &&
+        t.isCallExpression(init.object) &&
+        isHookCallee((init.object as t.CallExpression).callee)
+      ) {
+        const declaration = path.parentPath
+        if (!declaration?.isVariableDeclaration() || typeof declaration.node.start !== 'number')
+          return
+        const declarationStart = declaration.node.start
+        const declarationEnd = declaration.node.end ?? declarationStart
+        const component = components
+          .filter((item) => declarationStart >= item.start && declarationEnd <= item.end)
+          .sort((left, right) => right.start - left.start || left.end - right.end)[0]
+        if (component) bindings.set(component.id, id.name)
       }
     },
   })
@@ -77,7 +124,7 @@ export function planReactBindings(
   let needsImport = false
   for (const component of components) {
     if (bindings.has(component.id)) continue
-    const name = allBindings.has('t') ? uniqueBindingName(component.id, allBindings) : 't'
+    const name = allBindings.has('t') ? uniqueBindingName(allBindings) : 't'
     bindings.set(component.id, name)
     hookRanges.add(component.id)
     needsImport = true
@@ -105,15 +152,20 @@ export function planReactBindings(
         : `const { t: ${binding} } = ${hookCallee}();`
     if (component.expressionBody) {
       const indent = componentIndent(content, component)
+      const alreadyParenthesized =
+        component.expressionStart !== undefined && content[component.expressionStart] === '('
+      // `() => (<div/>)` is already parenthesized — do not add a second pair.
+      const open = alreadyParenthesized ? 'return ' : 'return ('
+      const close = alreadyParenthesized ? '' : ')'
       edits.push({
         range: { start: component.expressionStart!, end: component.expressionStart! },
-        replacement: `\n${indent}{\n${indent}  ${hook}\n${indent}  return (`,
+        replacement: `\n${indent}{\n${indent}  ${hook}\n${indent}  ${open}`,
         kind: 'hook',
         groupId: component.id,
       })
       edits.push({
         range: { start: component.expressionEnd!, end: component.expressionEnd! },
-        replacement: `)\n${indent}}`,
+        replacement: `${close}\n${indent}}`,
         kind: 'hook',
         groupId: component.id,
       })
@@ -142,11 +194,26 @@ function uniqueComponents(findings: ScanResult[]): ComponentContext[] {
 function collectBindingNames(ast: t.File): Set<string> {
   const names = new Set<string>()
   traverse(ast, {
+    ImportDeclaration(path) {
+      for (const specifier of path.node.specifiers) {
+        if (t.isImportSpecifier(specifier)) names.add(specifier.local.name)
+        else if (t.isImportDefaultSpecifier(specifier) || t.isImportNamespaceSpecifier(specifier)) {
+          names.add(specifier.local.name)
+        }
+      }
+    },
     VariableDeclarator(path) {
-      if (t.isIdentifier(path.node.id)) names.add(path.node.id.name)
+      collectPatternNames(path.node.id as t.Node, names)
     },
     Function(path) {
+      const node = path.node
+      if (t.isFunctionDeclaration(node) || t.isFunctionExpression(node)) {
+        if (node.id) names.add(node.id.name)
+      }
       for (const parameter of path.node.params) collectPatternNames(parameter, names)
+    },
+    ClassDeclaration(path) {
+      if (path.node.id) names.add(path.node.id.name)
     },
     CatchClause(path) {
       if (path.node.param) collectPatternNames(path.node.param, names)
@@ -175,7 +242,12 @@ function programInsertionOffset(program: t.Program, content: string): number {
     .filter((statement): statement is t.ImportDeclaration => t.isImportDeclaration(statement))
     .map((statement) => statement.end ?? 0)
   const offset = Math.max(0, ...directiveEnds, ...importEnds)
-  return offset === 0 ? 0 : Math.min(content.length, offset)
+  if (offset === 0) {
+    // Preserve shebang (`#!/usr/bin/env node`) and leading license comments.
+    const match = /^(?:#!.*\n)?(?:\s*(?:\/\/.*|\/\*[\s\S]*?\*\/)\s*\n)*/u.exec(content)
+    return match ? match[0].length : 0
+  }
+  return Math.min(content.length, offset)
 }
 
 function buildReactImport(content: string, program: t.Program): string {
@@ -198,7 +270,7 @@ function withIndent(content: string, component: ComponentContext, replacement: s
   return replacement.replace(/\n/gu, `\n${indent}`)
 }
 
-function uniqueBindingName(componentId: string, used: Set<string>): string {
+function uniqueBindingName(used: Set<string>): string {
   const base = 'i18nT'
   if (!used.has(base)) return base
   let index = 2

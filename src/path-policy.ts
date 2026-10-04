@@ -2,7 +2,17 @@ import { lstatSync, realpathSync, statSync } from 'node:fs'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { HunterError } from './errors.js'
 
-export const sourceExtensions = ['.vue', '.ts', '.tsx', '.js', '.jsx'] as const
+export const sourceExtensions = [
+  '.vue',
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mts',
+  '.cts',
+  '.mjs',
+  '.cjs',
+] as const
 
 /**
  * Single source of truth for "is this a Vue single-file component?". Discovery
@@ -12,6 +22,32 @@ export const sourceExtensions = ['.vue', '.ts', '.tsx', '.js', '.jsx'] as const
  */
 export function isVueSourcePath(filePath: string): boolean {
   return extname(filePath).toLowerCase() === '.vue'
+}
+
+/** TypeScript-capable sources (`.ts`/`.tsx`/`.mts`/`.cts`, plus Vue SFC scripts). */
+export function isTypeScriptSourcePath(filePath: string): boolean {
+  if (isVueSourcePath(filePath)) return true
+  const extension = extname(filePath).toLowerCase()
+  return extension === '.ts' || extension === '.tsx' || extension === '.mts' || extension === '.cts'
+}
+
+/**
+ * Sources that may contain JSX syntax and must be parsed/validated with the JSX plugin.
+ *
+ * `.mts`/`.cts` are intentionally excluded: TypeScript never enables JSX in
+ * those extensions, so they are always parsed without the JSX plugin. Plain
+ * `.ts` is likewise excluded (use `.tsx` for JSX). `.vue` is handled by the
+ * Vue SFC parser, never the Babel JSX path.
+ */
+export function isJsxSourcePath(filePath: string): boolean {
+  const extension = extname(filePath).toLowerCase()
+  return (
+    extension === '.js' ||
+    extension === '.jsx' ||
+    extension === '.tsx' ||
+    extension === '.mjs' ||
+    extension === '.cjs'
+  )
 }
 
 export function canonicalizeRoot(rootPath: string): string {
@@ -76,6 +112,20 @@ export function resolveContainedPath(
   options: { allowMissing?: boolean; allowedExtensions?: readonly string[] } = {},
 ): { path: string; relativePath: string } {
   const canonicalRoot = canonicalizeRoot(rootPath)
+  return resolveContainedPathFromCanonicalRoot(canonicalRoot, relativePath, options)
+}
+
+/**
+ * Variant of {@link resolveContainedPath} for callers that already hold a
+ * canonical root (see {@link canonicalizeRoot}). The scanner resolves thousands
+ * of files under one root; re-running `realpathSync` per file is pure overhead,
+ * so loops must canonicalize once and reuse this helper.
+ */
+export function resolveContainedPathFromCanonicalRoot(
+  canonicalRoot: string,
+  relativePath: string,
+  options: { allowMissing?: boolean; allowedExtensions?: readonly string[] } = {},
+): { path: string; relativePath: string } {
   const portablePath = validatePortableRelativePath(relativePath, options.allowedExtensions ?? [])
   const candidate = resolve(canonicalRoot, portablePath)
 
@@ -110,7 +160,21 @@ export function resolveContainedSourcePath(
   relativePath: string,
   allowedExtensions: readonly string[] = sourceExtensions,
 ): { path: string; relativePath: string } {
-  const resolved = resolveContainedPath(rootPath, relativePath, {
+  const canonicalRoot = canonicalizeRoot(rootPath)
+  return resolveContainedSourcePathFromCanonicalRoot(canonicalRoot, relativePath, allowedExtensions)
+}
+
+/**
+ * Canonical-root variant of {@link resolveContainedSourcePath}. Prefer this in
+ * per-file scan loops where the root was already canonicalized once via
+ * {@link canonicalizeRoot}; it skips the redundant per-file `realpathSync`.
+ */
+export function resolveContainedSourcePathFromCanonicalRoot(
+  canonicalRoot: string,
+  relativePath: string,
+  allowedExtensions: readonly string[] = sourceExtensions,
+): { path: string; relativePath: string } {
+  const resolved = resolveContainedPathFromCanonicalRoot(canonicalRoot, relativePath, {
     allowedExtensions,
   })
 

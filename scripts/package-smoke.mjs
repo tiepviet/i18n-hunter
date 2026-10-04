@@ -12,9 +12,18 @@ mkdirSync(packDir, { recursive: true })
 mkdirSync(consumer, { recursive: true })
 
 function command(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: 120_000 })
+  const isNpmOnWindows = command === 'npm' && process.platform === 'win32'
+  const executable = isNpmOnWindows ? 'npm.cmd' : command
+  const result = spawnSync(executable, args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: 120_000,
+    shell: isNpmOnWindows,
+  })
   if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`)
+    throw new Error(
+      `${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}\n${result.error ?? ''}`,
+    )
   }
   return result
 }
@@ -69,8 +78,17 @@ try {
     "import hunter = require('i18n-hunter')\nconst value: typeof hunter = hunter\nvoid value\n",
   )
   command(
-    join(consumer, 'node_modules/.bin/tsc'),
-    ['--noEmit', '--strict', '--module', 'Node16', '--moduleResolution', 'Node16', 'index.cts'],
+    process.execPath,
+    [
+      join(consumer, 'node_modules/typescript/bin/tsc'),
+      '--noEmit',
+      '--strict',
+      '--module',
+      'Node16',
+      '--moduleResolution',
+      'Node16',
+      'index.cts',
+    ],
     consumer,
   )
 

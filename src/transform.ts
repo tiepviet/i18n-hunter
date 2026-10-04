@@ -5,7 +5,7 @@ import { HunterError, safeMessage } from './errors.js'
 import { planReactBindings } from './inject-react.js'
 import { planVueBindings } from './inject-vue.js'
 import { parserPlugins } from './javascript-extractor.js'
-import { isVueSourcePath } from './path-policy.js'
+import { isJsxSourcePath, isTypeScriptSourcePath, isVueSourcePath } from './path-policy.js'
 import { verifyReportStructure } from './report-verification.js'
 import { hashText } from './source-range.js'
 import { applyTextEdits, validateFindingsAgainstSource, type TextEdit } from './text-edit.js'
@@ -39,21 +39,42 @@ export async function createFileTransformPlan(
   }
 
   const isVue = isVueSourcePath(filePath)
-  const isTypeScript =
-    filePath.toLowerCase().endsWith('.ts') || filePath.toLowerCase().endsWith('.tsx') || isVue
+  const isTypeScript = isTypeScriptSourcePath(filePath)
   const bindingPlan = isVue
     ? planVueBindings(content, filePath, findings)
     : planReactBindings(content, filePath, findings)
   const edits = [...bindingPlan.edits]
 
+  const unsupported: string[] = []
   for (const finding of findings) {
-    const binding = bindingForFinding(finding, bindingPlan.bindings, isVue)
-    edits.push({
-      range: finding.range,
-      replacement: replacementForFinding(finding, content, binding, isVue || isTypeScript),
-      kind: 'finding',
-      groupId: finding.component?.id ?? `template-${finding.range.start}`,
-    })
+    try {
+      const binding = bindingForFinding(finding, bindingPlan.bindings, isVue)
+      edits.push({
+        range: finding.range,
+        replacement: replacementForFinding(
+          finding,
+          content,
+          binding,
+          isVue || isTypeScript,
+          filePath,
+        ),
+        kind: 'finding',
+        groupId: finding.component?.id ?? `template-${finding.range.start}`,
+      })
+    } catch (error) {
+      if (error instanceof HunterError && error.code === 'E_UNSUPPORTED_TRANSFORM') {
+        unsupported.push(`${finding.filePath}:${finding.lineNumber} (${finding.transform})`)
+        continue
+      }
+      throw error
+    }
+  }
+  if (unsupported.length > 0) {
+    throw new HunterError(
+      'E_UNSUPPORTED_TRANSFORM',
+      `Finding(s) require manual component-aware translation (${unsupported.length}): ${unsupported.slice(0, 5).join('; ')}${unsupported.length > 5 ? `; …+${unsupported.length - 5} more` : ''}. Resolve them manually and regenerate the report.`,
+      filePath,
+    )
   }
 
   const transformed = applyTextEdits(content, edits)
@@ -97,16 +118,27 @@ function replacementForFinding(
   content: string,
   binding: string | undefined,
   typescript: boolean,
+  filePath: string,
 ): string {
   const key = finding.suggestedKey
   switch (finding.transform) {
     case 'vue-template-text':
       return `{{ $t('${key}') }}`
     case 'vue-template-attribute': {
+      // Interpolation and directive-inner ranges are bare string literals
+      // (`{{ 'a' }}`, `v-text="'a'"`): always replace with a bare `$t`.
+      // Only whole-attribute ranges (`placeholder="a"`) rewrite the attribute.
+      // Branch on context first: `raw.includes('=')` misfires for values like 'a=b'.
+      if (finding.context === 'interpolation:string' || finding.context === 'directive:v-text')
+        return `$t('${key}')`
       const raw = content.slice(finding.range.start, finding.range.end)
       if (!raw.includes('=')) return `$t('${key}')`
-      const attribute = finding.context.split(':')[1]
-      if (!attribute || !/^[a-z][a-z0-9-]*$/u.test(attribute)) {
+      const parts = finding.context.split(':')
+      if (parts.length !== 2) {
+        throw new HunterError('E_REPORT_SCHEMA', 'Invalid Vue attribute context', finding.filePath)
+      }
+      const attribute = parts[1]
+      if (!attribute || !/^[A-Za-z][A-Za-z0-9_-]*$/u.test(attribute)) {
         throw new HunterError('E_REPORT_SCHEMA', 'Invalid Vue attribute context', finding.filePath)
       }
       return `:${attribute}="$t('${key}')"`
@@ -114,7 +146,10 @@ function replacementForFinding(
     case 'react-jsx-text':
       return `{${binding}('${key}')}`
     case 'react-jsx-attribute': {
-      const before = content.slice(0, finding.range.start).trimEnd()
+      // Only inspect a small window before the range: the exact range exists,
+      // so a full `slice(0, start)` scan violates the "never search by string" rule.
+      const windowStart = Math.max(0, finding.range.start - 64)
+      const before = content.slice(windowStart, finding.range.start).trimEnd()
       const expression = `${binding}('${key}')`
       return before.endsWith('=') ? `{${expression}}` : expression
     }
@@ -131,7 +166,7 @@ function replacementForFinding(
         )
       const raw = content.slice(finding.range.start, finding.range.end)
       const expression = parseExpression(raw, {
-        plugins: parserPlugins({ typescript, jsx: false }),
+        plugins: parserPlugins({ typescript, jsx: isJsxSourcePath(filePath) }),
       })
       if (!t.isTemplateLiteral(expression)) {
         throw new HunterError('E_REPORT_SCHEMA', 'Expected a template literal', finding.filePath)
@@ -141,6 +176,12 @@ function replacementForFinding(
         .join(', ')
       return `${binding}('${key}', { ${interpolation} })`
     }
+    default:
+      throw new HunterError(
+        'E_UNSUPPORTED_TRANSFORM',
+        `Unsupported transform kind: ${(finding as { transform: string }).transform}`,
+        finding.filePath,
+      )
   }
 }
 
@@ -189,7 +230,7 @@ async function validateTransformedSource(
       allowAwaitOutsideFunction: true,
       plugins: parserPlugins({
         typescript: isTypeScript,
-        jsx: filePath.endsWith('.tsx') || filePath.endsWith('.jsx'),
+        jsx: isJsxSourcePath(filePath),
       }),
     })
   } catch (error) {

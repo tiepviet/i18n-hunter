@@ -1,6 +1,6 @@
 # Report Schema v2
 
-Reports are strict runtime-validated JSON. Unknown fields, invalid hashes, duplicate IDs/ranges, malformed paths, inconsistent summaries, and legacy duplicated reports are rejected.
+Reports are strict runtime-validated JSON. Unknown fields, invalid hashes, duplicate IDs/ranges, overlapping ranges, malformed paths, inconsistent summaries, and legacy duplicated reports are rejected.
 
 ## Top level
 
@@ -11,7 +11,7 @@ Reports are strict runtime-validated JSON. Unknown fields, invalid hashes, dupli
   "complete": true,
   "scan": {
     "paths": ["src"],
-    "includePatterns": ["**/*.{vue,ts,tsx,js,jsx}"],
+    "includePatterns": ["**/*.{vue,ts,tsx,js,jsx,mts,cts,mjs,cjs}"],
     "excludePatterns": ["**/node_modules/**"],
     "limits": {
       "maxFileBytes": 2000000,

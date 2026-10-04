@@ -351,6 +351,8 @@ describe('apply transactions', () => {
   })
 
   it('preserves source file modes across apply and rollback', async () => {
+    // Windows ACLs cannot represent POSIX modes (stat always reports 0o666/0o444).
+    if (process.platform === 'win32') return
     project = createTempProject()
     const sourcePath = project.write(
       'src/App.tsx',

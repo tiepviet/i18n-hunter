@@ -26,4 +26,22 @@ describe('report formatter', () => {
       }),
     ).toThrow(/filename/i)
   })
+
+  it('suffixes colliding report filenames instead of overwriting', () => {
+    project = createTempProject()
+    const first = exportReport(createReport(), {
+      outputDir: project!.root,
+      filename: 'report',
+      json: true,
+      markdown: false,
+    })
+    const second = exportReport(createReport(), {
+      outputDir: project!.root,
+      filename: 'report',
+      json: true,
+      markdown: false,
+    })
+    expect(first[0]).toMatch(/report\.json$/u)
+    expect(second[0]).toMatch(/report-1\.json$/u)
+  })
 })

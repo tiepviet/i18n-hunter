@@ -1,5 +1,7 @@
 import { basename, join } from 'node:path'
+import { existsSync } from 'node:fs'
 import { atomicWriteFile } from './atomic-write.js'
+import { HunterError } from './errors.js'
 import { ExtractionReportSchema } from './report-schema.js'
 import {
   findingCategories,
@@ -39,7 +41,15 @@ export function categorizeFindings(findings: ScanResult[]): CategorizedResults {
 }
 
 export function generateMarkdownReport(input: ExtractionReport): string {
-  const report = ExtractionReportSchema.parse(input)
+  let report: ExtractionReport
+  try {
+    report = ExtractionReportSchema.parse(input)
+  } catch (error) {
+    throw new HunterError(
+      'E_REPORT_SCHEMA',
+      `Invalid report for Markdown export: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
+    )
+  }
   const categorized = categorizeFindings(report.findings)
   const lines: string[] = [
     '# i18n-hunter Hunt Report',
@@ -93,24 +103,40 @@ export function generateMarkdownReport(input: ExtractionReport): string {
 }
 
 export function generateJsonReport(report: ExtractionReport, pretty = true): string {
-  const validated = ExtractionReportSchema.parse(report)
+  let validated: ExtractionReport
+  try {
+    validated = ExtractionReportSchema.parse(report)
+  } catch (error) {
+    throw new HunterError(
+      'E_REPORT_SCHEMA',
+      `Invalid report for JSON export: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
+    )
+  }
   return pretty ? JSON.stringify(validated, null, 2) : JSON.stringify(validated)
 }
 
 export function exportReport(reportInput: ExtractionReport, options: ExportOptions): string[] {
-  const report = ExtractionReportSchema.parse(reportInput)
+  let report: ExtractionReport
+  try {
+    report = ExtractionReportSchema.parse(reportInput)
+  } catch (error) {
+    throw new HunterError(
+      'E_REPORT_SCHEMA',
+      `Invalid report for export: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
+    )
+  }
   const { outputDir, filename, json = true, markdown = true, prettyJson = true } = options
   const safeFilename = validateFilename(filename)
   const created: string[] = []
 
   if (json) {
-    const path = join(outputDir, `${safeFilename}.json`)
+    const path = uniqueReportPath(outputDir, safeFilename, 'json')
     atomicWriteFile(path, generateJsonReport(report, prettyJson), 0o600)
     created.push(path)
   }
 
   if (markdown) {
-    const path = join(outputDir, `${safeFilename}.md`)
+    const path = uniqueReportPath(outputDir, safeFilename, 'md')
     atomicWriteFile(path, generateMarkdownReport(report), 0o600)
     created.push(path)
   }
@@ -118,8 +144,28 @@ export function exportReport(reportInput: ExtractionReport, options: ExportOptio
   return created
 }
 
+function uniqueReportPath(outputDir: string, basename: string, extension: string): string {
+  // Never overwrite an existing report: suffix -1, -2, … so a re-run with an
+  // explicit --filename cannot silently destroy the previous report.
+  const first = join(outputDir, `${basename}.${extension}`)
+  if (!existsSync(first)) return first
+  for (let index = 1; index <= 100; index += 1) {
+    const candidate = join(outputDir, `${basename}-${index}.${extension}`)
+    if (!existsSync(candidate)) return candidate
+  }
+  throw new HunterError('E_INVALID_INPUT', `Report file already exists: ${first}`, first)
+}
+
 export function generateSummary(reportInput: ExtractionReport): string {
-  const report = ExtractionReportSchema.parse(reportInput)
+  let report: ExtractionReport
+  try {
+    report = ExtractionReportSchema.parse(reportInput)
+  } catch (error) {
+    throw new HunterError(
+      'E_REPORT_SCHEMA',
+      `Invalid report for summary: ${(error instanceof Error ? error.message : String(error)).slice(0, 500)}`,
+    )
+  }
   return [
     '=== i18n-hunter — Extraction Summary ===',
     `Files discovered:      ${report.summary.filesDiscovered}`,
@@ -153,6 +199,9 @@ function inlineCode(value: string): string {
   )
   const fence = '`'.repeat(longestRun + 1)
   const padding = singleLine.startsWith('`') || singleLine.endsWith('`') ? ' ' : ''
+  // Untrusted values are HTML-escaped even inside code spans so `<img>` can never
+  // appear literally in derived Markdown. This renders `a&b` as `a&amp;b` inside
+  // code spans — a deliberate safety tradeoff verified by `markdown-safety.test.ts`.
   const safeValue = escapeHtml(singleLine).replace(/\[/gu, '&#91;').replace(/\]/gu, '&#93;')
   return `${fence}${padding}${safeValue}${padding}${fence}`
 }
@@ -173,7 +222,7 @@ function escapeHtml(value: string): string {
 function validateFilename(filename: string): string {
   const normalized = basename(filename)
   if (!filename || normalized !== filename || normalized === '.' || normalized === '..') {
-    throw new Error('Report filename must be a single safe filename')
+    throw new HunterError('E_INVALID_INPUT', 'Report filename must be a single safe filename')
   }
   return normalized
 }

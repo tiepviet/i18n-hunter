@@ -13,12 +13,14 @@ export function findFiles(
   excludePatterns: string[] = [],
   basePath: string,
   limits?: Partial<ScanLimits>,
+  stateDir?: string,
 ): DiscoveryResult {
   return discoverSourceFiles(basePath, {
     scanPaths: [dirPath],
     includePatterns,
     excludePatterns,
     limits,
+    ...(stateDir ? { stateDir } : {}),
   })
 }
 
@@ -28,7 +30,14 @@ export function getAllFiles(
   excludePatterns: string[] = [],
   basePath: string,
   limits?: Partial<ScanLimits>,
+  stateDir?: string,
 ): DiscoveryResult {
-  const options: DiscoveryOptions = { scanPaths, includePatterns, excludePatterns, limits }
+  const options: DiscoveryOptions = {
+    scanPaths,
+    includePatterns,
+    excludePatterns,
+    limits,
+    ...(stateDir ? { stateDir } : {}),
+  }
   return discoverSourceFiles(basePath, options)
 }

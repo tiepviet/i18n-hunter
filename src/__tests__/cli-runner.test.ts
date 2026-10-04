@@ -42,6 +42,15 @@ describe('CLI runner', () => {
     expect(existsSync(join(project.root, 'i18n-reports'))).toBe(false)
   })
 
+  it('includes the HunterError code in stderr for CLI failures', async () => {
+    project = createTempProject()
+    project.write('src/App.tsx', 'export const App = () => <div>Hello</div>')
+    const context = io()
+
+    expect(await runCli(['scan', '--format', 'xml'], context.io)).toBe(1)
+    expect(context.output().stderr).toMatch(/\[i18n-hunter\] E_INVALID_INPUT: /)
+  })
+
   it('writes reports for clean and incomplete scans with documented exit codes', async () => {
     project = createTempProject()
     project.write('src/App.tsx', 'export const App = () => <div>Hello</div>')

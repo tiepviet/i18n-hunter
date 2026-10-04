@@ -1,3 +1,5 @@
+import { HunterError } from './errors.js'
+
 export type ParsedCliArgs =
   | { kind: 'global-help' }
   | { kind: 'version' }
@@ -67,7 +69,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const first = argv[0]!
   if (first === '--help' || first === '-h') return { kind: 'global-help' }
   if (first === '--version' || first === '-v') return { kind: 'version' }
-  if (!commands.has(first as CommandName)) throw new Error(`Unknown command: ${first}`)
+  if (!commands.has(first as CommandName))
+    throw new HunterError('E_INVALID_INPUT', `Unknown command: ${first}`)
 
   const command = first as CommandName
   const rest = argv.slice(1)
@@ -128,7 +131,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
         stateDir: options.values['state-dir'] ?? '.i18n-hunter',
       }
     case 'clean':
-      if (!options.flags.has('yes')) throw new Error('--yes is required for clean')
+      if (!options.flags.has('yes'))
+        throw new HunterError('E_INVALID_INPUT', '--yes is required for clean')
       return {
         kind: 'clean',
         base: options.values.base ?? '.',
@@ -146,26 +150,29 @@ function parseOptions(
   const flags = new Set<string>()
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!
-    if (!argument.startsWith('--')) throw new Error(`Unexpected positional argument: ${argument}`)
+    if (!argument.startsWith('--'))
+      throw new HunterError('E_INVALID_INPUT', `Unexpected positional argument: ${argument}`)
     const equalsIndex = argument.indexOf('=')
     const name = argument.slice(2, equalsIndex >= 0 ? equalsIndex : undefined)
     const inlineValue = equalsIndex >= 0 ? argument.slice(equalsIndex + 1) : undefined
 
     if (flagOptions[command].has(name)) {
-      if (inlineValue !== undefined) throw new Error(`--${name} does not accept a value`)
+      if (inlineValue !== undefined)
+        throw new HunterError('E_INVALID_INPUT', `--${name} does not accept a value`)
       flags.add(name)
       continue
     }
     if (!valueOptions[command].has(name))
-      throw new Error(`Unknown option for ${command}: --${name}`)
+      throw new HunterError('E_INVALID_INPUT', `Unknown option for ${command}: --${name}`)
     if (!repeatable.has(name) && values[name] !== undefined)
-      throw new Error(`Duplicate option: --${name}`)
+      throw new HunterError('E_INVALID_INPUT', `Duplicate option: --${name}`)
     const value = inlineValue ?? args[index + 1]
-    if (value === undefined || value.startsWith('--')) throw new Error(`--${name} requires a value`)
+    if (value === undefined || value.startsWith('--'))
+      throw new HunterError('E_INVALID_INPUT', `--${name} requires a value`)
     if (inlineValue === undefined) index += 1
-    if (name === 'path') {
-      const existing = values.path?.split(',').filter(Boolean) ?? []
-      values.path = [
+    if (name === 'path' || name === 'paths') {
+      const existing = values[name]?.split(',').filter(Boolean) ?? []
+      values[name] = [
         ...existing,
         ...value
           .split(',')
@@ -182,14 +189,17 @@ function parseOptions(
 function validateFormats(value: string): Array<'json' | 'md'> {
   const formats = value.split(',').map((item) => item.trim())
   if (formats.some((format) => format !== 'json' && format !== 'md')) {
-    throw new Error(`Unsupported format: ${value}`)
+    throw new HunterError('E_INVALID_INPUT', `Unsupported format: ${value}`)
   }
   return [...new Set(formats)] as Array<'json' | 'md'>
 }
 
 function validateValueExclusivity(flags: Set<string>): boolean {
   if (flags.has('include-values') && flags.has('redact-values')) {
-    throw new Error('--include-values and --redact-values are mutually exclusive')
+    throw new HunterError(
+      'E_INVALID_INPUT',
+      '--include-values and --redact-values are mutually exclusive',
+    )
   }
   return flags.has('include-values')
 }
@@ -197,7 +207,7 @@ function validateValueExclusivity(flags: Set<string>): boolean {
 function validateFailOn(value: string | undefined): 'error' | 'warning' | 'never' {
   const normalized = value ?? 'error'
   if (normalized !== 'error' && normalized !== 'warning' && normalized !== 'never') {
-    throw new Error(`Invalid --fail-on value: ${value}`)
+    throw new HunterError('E_INVALID_INPUT', `Invalid --fail-on value: ${value}`)
   }
   return normalized
 }
@@ -206,18 +216,17 @@ function positiveInteger(value: string | undefined, name: string): number | unde
   if (value === undefined) return undefined
   const parsed = Number(value)
   if (!Number.isSafeInteger(parsed) || parsed <= 0)
-    throw new Error(`--${name} must be a positive integer`)
+    throw new HunterError('E_INVALID_INPUT', `--${name} must be a positive integer`)
   return parsed
 }
 
 function requireValue(value: string | undefined, message: string): void {
-  if (!value) throw new Error(message)
+  if (!value) throw new HunterError('E_INVALID_INPUT', message)
 }
 
 function defaultReportFilename(): string {
-  return `i18n-hunt-report-${new Date()
-    .toISOString()
-    .replace(/[-:]/gu, '')
-    .replace(/\.\d{3}Z$/u, 'Z')
-    .replace('T', '-')}`
+  // Keep milliseconds so two scans within the same second do not collide.
+  // Strip `-`, `:`, `.` and the trailing `Z` so the name stays a single safe
+  // filename segment (no dots that read as extensions, no `Z` suffix noise).
+  return `i18n-hunt-report-${new Date().toISOString().replace(/[-:.]/gu, '').replace('T', '-').replace(/Z$/u, '')}`
 }

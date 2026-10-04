@@ -1,10 +1,10 @@
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { applyReport, cleanTransactions, rollbackTransactions } from '../applier.js'
 import { scanForHardcodedStrings } from '../scanner.js'
 import { hashText } from '../source-range.js'
-import { atomicWriteFile } from '../atomic-write.js'
+import { atomicWriteFile, sanitizeFileMode } from '../atomic-write.js'
 import { parseManifest } from '../manifest-schema.js'
 import { readJsonBounded } from '../safe-json.js'
 import { resolveStatePaths, withStateLock } from '../transaction-store.js'
@@ -252,6 +252,74 @@ describe('security integration', () => {
         throw new Error('operation failed')
       }),
     ).toThrow(/operation failed/)
+    expect(existsSync(paths.lock)).toBe(false)
+  })
+
+  it('sweeps stale lock staging files on acquire', () => {
+    const temp = project()
+    const paths = resolveStatePaths(temp.root, '.state')
+    temp.mkdir('.state')
+    const stale = join(temp.root, '.state', '.lock-999999-1-abcdef.tmp')
+    writeFileSync(stale, 'stale staging', 'utf8')
+    expect(() => withStateLock(paths, () => undefined)).not.toThrow()
+    expect(existsSync(stale)).toBe(false)
+    expect(existsSync(paths.lock)).toBe(false)
+  })
+
+  it('rejects manifests with world-writable/executable modes', () => {
+    const base = {
+      schemaVersion: 2 as const,
+      transactionId: '11111111-1111-4111-8111-111111111111',
+      state: 'applied' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      projectRootHash: 'a'.repeat(64),
+      reportHash: 'b'.repeat(64),
+      parentTransactionId: null,
+      entries: [
+        {
+          filePath: 'src/App.tsx',
+          backupPath: 'backups/src/App.tsx',
+          beforeHash: 'c'.repeat(64),
+          afterHash: 'd'.repeat(64),
+          mode: 0o777,
+        },
+      ],
+    }
+    expect(() => parseManifest(base)).toThrow(/manifest|mode|777|0o755/i)
+    // Legitimate restrictive modes still pass the schema.
+    expect(() =>
+      parseManifest({ ...base, entries: [{ ...base.entries[0]!, mode: 0o644 }] }),
+    ).not.toThrow()
+  })
+
+  it('never restores world-writable or executable file modes', () => {
+    expect(sanitizeFileMode(0o777)).toBe(0o644)
+    expect(sanitizeFileMode(0o755)).toBe(0o644)
+    expect(sanitizeFileMode(0o644)).toBe(0o644)
+    expect(sanitizeFileMode(0o600)).toBe(0o600)
+    expect(sanitizeFileMode(0o640)).toBe(0o640)
+    // Windows ACLs cannot represent POSIX modes (stat always reports 0o666/0o444).
+    if (process.platform === 'win32') return
+    const temp = project()
+    const target = temp.write('mode.txt', 'old')
+    atomicWriteFile(target, 'new', 0o777)
+    const restored = statSync(target).mode & 0o777
+    expect(restored & 0o002).toBe(0)
+    expect(restored & 0o111).toBe(0)
+    expect(restored).toBe(0o644)
+  })
+
+  it('rejects async callbacks in withStateLock and releases the lock', () => {
+    const temp = project()
+    const paths = resolveStatePaths(temp.root, '.state')
+    expect(() =>
+      withStateLock(paths, (() => Promise.resolve('leaked')) as unknown as () => string),
+    ).toThrow(/synchronous/i)
+    expect(existsSync(paths.lock)).toBe(false)
+    expect(() =>
+      withStateLock(paths, (() => ({ then: () => undefined })) as unknown as () => string),
+    ).toThrow(/synchronous/i)
     expect(existsSync(paths.lock)).toBe(false)
   })
 })

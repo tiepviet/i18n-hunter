@@ -21,10 +21,12 @@ export async function verifyReportStructure(
     )
   }
 
-  const candidates = new Map(result.candidates.map((candidate) => [rangeKey(candidate), candidate]))
+  const candidates = new Map(
+    result.candidates.map((candidate) => [rangeKey(filePath, candidate), candidate]),
+  )
   const reportedRanges = new Set<string>()
   for (const finding of findings) {
-    const key = rangeKey(finding)
+    const key = rangeKey(finding.filePath, finding)
     const candidate = candidates.get(key)
     if (!candidate) {
       throw new HunterError(
@@ -111,6 +113,6 @@ function componentsEqual(
   )
 }
 
-function rangeKey(value: { range: { start: number; end: number } }): string {
-  return `${value.range.start}:${value.range.end}`
+function rangeKey(filePath: string, value: { range: { start: number; end: number } }): string {
+  return `${filePath}:${value.range.start}:${value.range.end}`
 }

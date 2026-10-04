@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { HunterError } from './errors.js'
+import { scanLimitCeilings } from './limits.js'
 import { findingCategories, transformKinds, type ExtractionReport } from './types.js'
 
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/u)
@@ -12,10 +13,10 @@ const filePathSchema = z
   .string()
   .min(1)
   .max(4096)
-  .regex(/^(?!\/)(?![A-Za-z]:)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\\)[^:\0]+$/u)
+  .regex(/^(?!\/)(?![A-Za-z]:)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\\)(?!.*\/\/)[^:\0]+$/u)
   .refine(
     (value) =>
-      ['.vue', '.ts', '.tsx', '.js', '.jsx'].includes(
+      ['.vue', '.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'].includes(
         value.slice(value.lastIndexOf('.')).toLowerCase(),
       ),
     {
@@ -27,7 +28,7 @@ const diagnosticPathSchema = z
   .string()
   .min(1)
   .max(4096)
-  .regex(/^(?!\/)(?![A-Za-z]:)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\\)[^:]+$/u)
+  .regex(/^(?!\/)(?![A-Za-z]:)(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\\)(?!.*\/\/)[^:]+$/u)
   .refine(
     (value) =>
       [...value].every((character) => {
@@ -68,7 +69,7 @@ export const ScanResultSchema = z
       .string()
       .min(1)
       .max(200)
-      .regex(/^[a-z0-9:._-]+$/u),
+      .regex(/^(?!.*\.\.)(?!.*:::?)(?!.*::$)(?!^:)(?!.*:$)[A-Za-z0-9:._-]+$/u),
     category: z.enum(findingCategories),
     transform: z.enum(transformKinds),
     range: z.strictObject({
@@ -85,6 +86,42 @@ export const ScanResultSchema = z
     }
     if (finding.endLineNumber < finding.lineNumber) {
       context.addIssue({ code: 'custom', message: 'End position precedes start position' })
+    }
+    if (finding.context.includes(':')) {
+      const parts = finding.context.split(':')
+      const prefix = `${parts[0]}:`
+      const lowerPrefix = prefix.toLowerCase()
+      const scopedPrefixes = ['attribute:', 'directive:', 'tag:', 'notification:', 'variable:']
+      if (scopedPrefixes.includes(lowerPrefix)) {
+        const suffix = finding.context.slice(prefix.length)
+        if (suffix.length === 0 || suffix.includes(':')) {
+          context.addIssue({ code: 'custom', message: 'Invalid context segments' })
+        }
+      } else if (parts.length !== 2 || parts[0]!.length === 0 || parts[1]!.length === 0) {
+        context.addIssue({ code: 'custom', message: 'Invalid context segments' })
+      }
+    }
+    if (finding.transform === 'vue-template-attribute') {
+      const ctx = finding.context
+      const validAttr = /^[A-Za-z][A-Za-z0-9_-]*$/u
+      const validTag = /^[a-z][a-z0-9-]*$/u
+      let ok = false
+      if (ctx === 'interpolation:string' || ctx === 'directive:v-text') {
+        ok = true
+      } else {
+        const separator = ctx.indexOf(':')
+        if (separator > 0) {
+          const scopedPrefix = ctx.slice(0, separator + 1).toLowerCase()
+          const suffix = ctx.slice(separator + 1)
+          if (suffix.length > 0 && !suffix.includes(':')) {
+            if (scopedPrefix === 'attribute:' && validAttr.test(suffix)) ok = true
+            else if (scopedPrefix === 'tag:' && validTag.test(suffix)) ok = true
+          }
+        }
+      }
+      if (!ok) {
+        context.addIssue({ code: 'custom', message: 'Invalid Vue attribute context' })
+      }
     }
   })
 
@@ -103,11 +140,11 @@ const diagnosticCountsSchema = z.strictObject({
 })
 
 const limitsSchema = z.strictObject({
-  maxFileBytes: z.number().int().positive().max(10_000_000),
-  maxFiles: z.number().int().positive().max(10_000),
-  maxTotalBytes: z.number().int().positive().max(100_000_000),
-  maxFindings: z.number().int().positive().max(10_000),
-  maxDepth: z.number().int().positive().max(100),
+  maxFileBytes: z.number().int().positive().max(scanLimitCeilings.maxFileBytes),
+  maxFiles: z.number().int().positive().max(scanLimitCeilings.maxFiles),
+  maxTotalBytes: z.number().int().positive().max(scanLimitCeilings.maxTotalBytes),
+  maxFindings: z.number().int().positive().max(scanLimitCeilings.maxFindings),
+  maxDepth: z.number().int().positive().max(scanLimitCeilings.maxDepth),
 })
 
 export const DiagnosticSchema = z.strictObject({
@@ -143,6 +180,7 @@ export const ExtractionReportSchema = z
   .superRefine((report, context) => {
     const ids = new Set<string>()
     const ranges = new Set<string>()
+    const intervalsByFile = new Map<string, Array<{ start: number; end: number; key: string }>>()
 
     for (const finding of report.findings) {
       if (ids.has(finding.id)) {
@@ -155,6 +193,26 @@ export const ExtractionReportSchema = z
         context.addIssue({ code: 'custom', message: `Duplicate source range: ${rangeKey}` })
       }
       ranges.add(rangeKey)
+
+      const intervals = intervalsByFile.get(finding.filePath) ?? []
+      intervals.push({ start: finding.range.start, end: finding.range.end, key: rangeKey })
+      intervalsByFile.set(finding.filePath, intervals)
+    }
+
+    // Linear sweep per file instead of O(n²) pairwise checks on untrusted input.
+    for (const [filePath, intervals] of intervalsByFile) {
+      intervals.sort((a, b) => a.start - b.start || a.end - b.end)
+      for (let i = 1; i < intervals.length; i += 1) {
+        const prev = intervals[i - 1]!
+        const cur = intervals[i]!
+        if (cur.start < prev.end && prev.start < cur.end && cur.key !== prev.key) {
+          context.addIssue({
+            code: 'custom',
+            message: `Overlapping source ranges in ${filePath}: ${prev.key} overlaps ${cur.key}`,
+          })
+          break
+        }
+      }
     }
 
     if (report.summary.findings !== report.findings.length) {

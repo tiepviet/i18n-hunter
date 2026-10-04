@@ -11,8 +11,11 @@ Ship a safe, verifiable core for Vue templates, React function components, Vue `
    - Expand compile and runtime fixtures before enabling automatic mutation.
 
 2. **React class and wrapper support**
-   - Define safe translation access for class components, `memo`, `forwardRef`, and render functions.
-   - Reject ambiguous wrappers until identity and scope tracking are proven.
+   - Class components and render functions outside a proven component scope remain
+     rejected as `E_UNSUPPORTED_TRANSFORM`.
+   - Direct and `export const X = memo(…)` / `forwardRef` / `observer` wrappers with
+     a statically resolvable inner function are supported; ambiguous wrappers
+     are still rejected until identity and scope tracking are proven.
 
 3. **Locale catalog integration**
    - Detect Vue I18n and i18next resource formats.

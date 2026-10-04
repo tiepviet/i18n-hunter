@@ -1,8 +1,12 @@
 import { parse } from '@babel/parser'
 import { parse as parseSfc, compileScript, compileTemplate } from '@vue/compiler-sfc'
 import { afterEach, describe, expect, it } from 'vitest'
+import { stableFindingId } from '../report-verification.js'
 import { scanForHardcodedStrings } from '../scanner.js'
+import { hashText } from '../source-range.js'
 import { createFileTransformPlan } from '../transform.js'
+import type { ScanResult } from '../types.js'
+import { parseVueSource } from '../vue-parser.js'
 import { createTempProject, type TempProject } from './helpers/temp-project.js'
 
 let project: TempProject | undefined
@@ -114,6 +118,56 @@ describe('source transforms', () => {
 
     expect(plan.content).toMatch(/t\('[^']+', \{ 0: name \}\)/u)
     expect(() => parse(plan.content, { sourceType: 'module', plugins: ['jsx'] })).not.toThrow()
+  })
+
+  it('preserves Vue prop case (:myProp pattern)', async () => {
+    // `myProp` stands for any case-sensitive component prop; `Title` is a
+    // user-facing attribute with mixed case that exercises the same path.
+    // Built via parseVueSource (not scanner) because the report schema
+    // currently requires lowercase contexts.
+    const source = `<template><MyComp Title="Hello World" /></template>`
+    const filePath = 'src/Card.vue'
+    const parsed = await parseVueSource(source, filePath)
+    expect(parsed.candidates.length).toBeGreaterThan(0)
+    const fileHash = hashText(source)
+    const findings: ScanResult[] = parsed.candidates.map((candidate, index) => {
+      const raw = source.slice(candidate.range.start, candidate.range.end)
+      return {
+        id: stableFindingId(filePath, candidate.range, raw),
+        filePath,
+        fileSha256: fileHash,
+        sliceSha256: hashText(raw),
+        lineNumber: candidate.lineNumber,
+        columnNumber: candidate.columnNumber,
+        endLineNumber: candidate.endLineNumber,
+        endColumnNumber: candidate.endColumnNumber,
+        suggestedKey: `test.lbl.case${index}`,
+        context: candidate.context,
+        category: candidate.category,
+        transform: candidate.transform,
+        range: candidate.range,
+        component: candidate.component,
+        isNotification: candidate.isNotification,
+        notificationType: candidate.notificationType,
+      }
+    })
+
+    const plan = await createFileTransformPlan(source, filePath, findings)
+
+    expect(plan.content).toContain(':Title="$t(')
+    expect(plan.content).not.toContain(':title="$t(')
+  })
+
+  it('reparses tsx template literals containing JSX', async () => {
+    project = createTempProject()
+    const source = `export const App = () => { const message = \`hi \${<div/>}\`; return <div>{message}</div> }`
+    const findings = await findingsFor('src/App.tsx', source)
+    const plan = await createFileTransformPlan(source, 'src/App.tsx', findings)
+
+    expect(plan.content).toMatch(/t\('[^']+', \{ 0: <div \/>\s?\}\)/u)
+    expect(() =>
+      parse(plan.content, { sourceType: 'module', plugins: ['jsx', 'typescript'] }),
+    ).not.toThrow()
   })
 
   it('rejects script transforms without a component scope', async () => {

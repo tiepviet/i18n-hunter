@@ -1,7 +1,7 @@
-import { resolve } from 'node:path'
+import { relative, resolve } from 'node:path'
 import { applyReport, cleanTransactions, rollbackTransactions } from './applier.js'
 import { parseCliArgs, type ParsedCliArgs } from './cli-args.js'
-import { errorMessage } from './errors.js'
+import { HunterError, safeMessage } from './errors.js'
 import { exportReport, generateSummary } from './report-formatter.js'
 import { scanForHardcodedStrings } from './scanner.js'
 import { syncReportMd } from './sync-report.js'
@@ -40,13 +40,14 @@ Usage:
 Options:
   --base <dir>                 Project root (default: current directory)
   --path <path>                File/directory to scan; repeatable
-  --paths <a,b>                Comma-separated scan paths
+  --paths <a,b>                Comma-separated scan paths (repeatable, accumulates)
   --output <dir>               Report directory (default: i18n-reports)
   --filename <name>            Report basename without extension
   --format <json|md|json,md>   Output format (default: json,md)
   --include-values             Include source values in reports (off by default)
   --redact-values              Explicitly redact source values (default)
   --readable-keys              Opt in to value-derived readable key segments
+  --state-dir <dir>            Managed state directory excluded from scan
   --fail-on <error|warning|never>
   --max-file-size <bytes>
   --max-files <count>
@@ -76,12 +77,22 @@ Usage:
   i18n-hunter clean --yes [--base <dir>] [--state-dir <dir>]`,
 }
 
+/**
+ * User-facing error rendering: preserve the machine-readable HunterError code
+ * and bound the message (safeMessage truncates to 1000 chars) so a large
+ * ZodError dump can never flood stderr unbounded.
+ */
+function formatCliError(error: unknown): string {
+  if (error instanceof HunterError) return `[i18n-hunter] ${error.code}: ${safeMessage(error)}\n`
+  return `[i18n-hunter] ${safeMessage(error)}\n`
+}
+
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   let args: ParsedCliArgs
   try {
     args = parseCliArgs(argv)
   } catch (error) {
-    io.stderr(`[i18n-hunter] ${errorMessage(error)}\n`)
+    io.stderr(formatCliError(error))
     return 1
   }
 
@@ -108,7 +119,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return await runClean(args, io)
     }
   } catch (error) {
-    io.stderr(`[i18n-hunter] ${errorMessage(error)}\n`)
+    io.stderr(formatCliError(error))
     return 1
   }
 }
@@ -117,12 +128,21 @@ async function runScan(args: Extract<ParsedCliArgs, { kind: 'scan' }>, io: CliIo
   const cwd = io.cwd()
   const basePath = resolve(cwd, args.base)
   const outputDir = resolve(cwd, args.output)
+  // A custom `--output` directory is not covered by the default
+  // `**/i18n-reports/**` exclusion: exclude it explicitly so future scans never
+  // ingest prior reports.
+  const outputRelative = relative(basePath, outputDir).replace(/\\/gu, '/')
+  const extraExcludes =
+    outputRelative && !outputRelative.startsWith('..') && outputRelative !== ''
+      ? [`${outputRelative}/**`]
+      : []
   const report = await scanForHardcodedStrings(
     {
       ...(args.scanPaths ? { scanPaths: args.scanPaths } : {}),
       includeValues: args.includeValues,
       readableKeys: args.readableKeys,
       ...(args.stateDir ? { stateDir: args.stateDir } : {}),
+      ...(extraExcludes.length > 0 ? { excludePatterns: extraExcludes } : {}),
       limits: args.limits,
     },
     basePath,
@@ -137,7 +157,12 @@ async function runScan(args: Extract<ParsedCliArgs, { kind: 'scan' }>, io: CliIo
   io.stdout(`${generateSummary(report)}\n\nReports created:\n`)
   for (const path of created) io.stdout(`  ${path}\n`)
   for (const diagnostic of report.diagnostics) {
-    io.stderr(`[${diagnostic.severity.toUpperCase()}] ${diagnostic.code}: ${diagnostic.message}\n`)
+    const location = diagnostic.filePath
+      ? ` ${diagnostic.filePath}${diagnostic.lineNumber ? `:${diagnostic.lineNumber}` : ''}${diagnostic.columnNumber !== undefined ? `:${diagnostic.columnNumber}` : ''}`
+      : ''
+    io.stderr(
+      `[${diagnostic.severity.toUpperCase()}] ${diagnostic.code}${location}: ${diagnostic.message}\n`,
+    )
   }
 
   if (args.failOn === 'never') return 0

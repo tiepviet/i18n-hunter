@@ -38,8 +38,8 @@ describe('scanner integration', () => {
       expect(finding.range.end).toBeGreaterThan(finding.range.start)
       expect(content.slice(finding.range.start, finding.range.end)).toBeTruthy()
     }
-    expect(react).toMatch(/src\/App\.tsx$/u)
-    expect(vue).toMatch(/src\/components\/Card\.vue$/u)
+    expect(react.replace(/\\/gu, '/')).toMatch(/src\/App\.tsx$/u)
+    expect(vue.replace(/\\/gu, '/')).toMatch(/src\/components\/Card\.vue$/u)
   })
 
   it('includes source values only when explicitly requested', async () => {

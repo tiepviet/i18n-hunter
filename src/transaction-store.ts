@@ -15,6 +15,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { hostname } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { atomicWriteFile } from './atomic-write.js'
@@ -115,13 +116,36 @@ export function assertOwnedState(paths: StatePaths, baseRoot: string): void {
   assertManagedChildren(paths)
 }
 
+/**
+ * Run a synchronous critical section under the exclusive state lock.
+ *
+ * The callback MUST be synchronous. An async (Promise-returning) callback
+ * would release the lock before the Promise settles, breaking mutual
+ * exclusion. Promise-returning callbacks are rejected with E_INVALID_INPUT.
+ */
 export function withStateLock<T>(paths: StatePaths, operation: () => T): T {
   if (!existsSync(paths.root)) mkdirSync(paths.root, { recursive: true, mode: 0o700 })
   assertManagedChildren(paths)
-  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const token = `${process.pid}-${Date.now()}-${randomBytes(8).toString('hex')}`
   acquireLock(paths, token)
   try {
-    return operation()
+    const result = operation()
+    if (
+      result instanceof Promise ||
+      typeof (result as unknown as { then?: unknown } | null | undefined)?.then === 'function'
+    ) {
+      // Avoid an unhandled rejection from the orphaned promise.
+      try {
+        ;(result as unknown as Promise<unknown>).catch(() => undefined)
+      } catch {
+        // Non-Promise thenables may not have .catch; ignoring is safe.
+      }
+      throw new HunterError(
+        'E_INVALID_INPUT',
+        'withStateLock requires a synchronous operation; use an async variant for Promise-returning callbacks',
+      )
+    }
+    return result
   } finally {
     releaseLock(paths, token)
   }
@@ -210,38 +234,71 @@ export function resolveBackupPath(
 export function listTransactionIds(paths: StatePaths): string[] {
   if (!existsSync(paths.transactions)) return []
   assertManagedChildren(paths)
-  return readdirSync(paths.transactions, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-    .map((entry) => entry.name)
-    .filter((name) => transactionIdPattern.test(name))
+  const ids: string[] = []
+  for (const entry of readdirSync(paths.transactions, { withFileTypes: true })) {
+    const full = join(paths.transactions, entry.name)
+    if (entry.isSymbolicLink() || lstatSync(full).isSymbolicLink()) {
+      throw new HunterError('E_SYMLINK_REJECTED', 'Transaction entries may not be symlinks', full)
+    }
+    if (!entry.isDirectory()) continue
+    if (!transactionIdPattern.test(entry.name)) continue
+    ids.push(entry.name)
+  }
+  return ids
 }
 
 export function removeTransaction(paths: StatePaths, transactionId: string): void {
   const directory = transactionDirectory(paths, transactionId)
   if (!existsSync(directory)) return
   const manifest = readManifest(paths, transactionId)
-  const backupDirectories = new Set<string>()
   for (const entry of manifest.entries) {
     const backup = resolveBackupPath(directory, entry.backupPath)
     try {
       unlinkSync(backup)
-      backupDirectories.add(dirname(backup))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new HunterError(
+          'E_CLEAN_FAILED',
+          `Unable to remove transaction backup: ${entry.backupPath}`,
+          transactionId,
+        )
+      }
     }
-  }
-  for (const backupDirectory of [...backupDirectories].sort(
-    (left, right) => right.length - left.length,
-  )) {
-    removeEmptyParents(backupDirectory, directory)
   }
   try {
     unlinkSync(manifestPath(paths, transactionId))
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new HunterError(
+        'E_CLEAN_FAILED',
+        'Unable to remove transaction manifest',
+        transactionId,
+      )
+    }
   }
-  rmdirSync(directory)
+  // Remove known backup parents best-effort, then anything left (e.g. attacker-
+  // planted extra files) via a bounded recursive remove so `clean` cannot wedge.
+  for (const backupDirectory of knownBackupParents(directory, manifest)) {
+    removeEmptyParents(backupDirectory, directory)
+  }
+  try {
+    rmdirSync(directory)
+  } catch {
+    rmSync(directory, { recursive: true, force: false })
+  }
   removeEmptyParents(dirname(directory), paths.transactions)
+}
+
+function knownBackupParents(directory: string, manifest: Manifest): string[] {
+  const directories = new Set<string>()
+  for (const entry of manifest.entries) {
+    try {
+      directories.add(dirname(resolveBackupPath(directory, entry.backupPath)))
+    } catch {
+      // Ignore unresolvable entries here; recursive fallback below still cleans.
+    }
+  }
+  return [...directories].sort((left, right) => right.length - left.length)
 }
 
 export function removeTransactionResidue(paths: StatePaths, transactionId: string): void {
@@ -251,7 +308,15 @@ export function removeTransactionResidue(paths: StatePaths, transactionId: strin
   if (!isInside(paths.transactions, canonical)) {
     throw new HunterError('E_MANIFEST_SCHEMA', 'Transaction residue escapes state root')
   }
-  rmSync(directory, { recursive: true, force: false })
+  try {
+    rmSync(directory, { recursive: true, force: false })
+  } catch (error) {
+    throw new HunterError(
+      'E_CLEAN_FAILED',
+      `Unable to remove transaction residue: ${(error as Error).message}`,
+      transactionId,
+    )
+  }
   removeEmptyParents(paths.transactions, paths.root)
 }
 
@@ -287,6 +352,7 @@ function assertManagedChildren(paths: StatePaths): void {
 }
 
 function acquireLock(paths: StatePaths, token: string): void {
+  sweepStaleStagingFiles(paths.root, token)
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const temporaryPath = join(paths.root, `.lock-${token}.tmp`)
     let descriptor: number | undefined
@@ -309,16 +375,25 @@ function acquireLock(paths: StatePaths, token: string): void {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt > 0) {
           throw new HunterError(
             'E_TRANSACTION_CONFLICT',
-            'Another i18n-hunter transaction is active',
+            `Another i18n-hunter transaction is active (lock held; holder: ${describeLockHolder(paths.lock)})`,
           )
         }
         if (!isStaleLock(paths.lock)) {
           throw new HunterError(
             'E_TRANSACTION_CONFLICT',
+            `Another i18n-hunter transaction is active (lock held; holder: ${describeLockHolder(paths.lock)})`,
+          )
+        }
+        try {
+          unlinkSync(paths.lock)
+        } catch (unlinkError) {
+          if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError
+          // Lost the race with another contender; treat as contention.
+          throw new HunterError(
+            'E_TRANSACTION_CONFLICT',
             'Another i18n-hunter transaction is active',
           )
         }
-        unlinkSync(paths.lock)
         continue
       }
     } finally {
@@ -333,29 +408,94 @@ function acquireLock(paths: StatePaths, token: string): void {
   throw new HunterError('E_TRANSACTION_CONFLICT', 'Another i18n-hunter transaction is active')
 }
 
-function releaseLock(paths: StatePaths, token: string): void {
+function sweepStaleStagingFiles(root: string, currentToken: string): void {
+  // Crashed holders leave `.lock-<token>.tmp` droppings. Sweep only files old
+  // enough that no live contender can own them (token embeds Date.now()).
+  let entries
   try {
-    const record = JSON.parse(readFileSync(paths.lock, 'utf8')) as LockRecord
-    if (record.token !== token) return
-    unlinkSync(paths.lock)
+    entries = readdirSync(root, { withFileTypes: true })
   } catch {
+    return
+  }
+  const now = Date.now()
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) continue
+    const match = /^\.lock-(.+)\.tmp$/u.exec(entry.name)
+    if (!match || match[1] === currentToken) continue
+    const parts = match[1]!.split('-')
+    const created = Number(parts[1])
+    if (!Number.isSafeInteger(created) || now - created < 3_600_000) continue
+    try {
+      const full = join(root, entry.name)
+      if (lstatSync(full).isSymbolicLink()) continue
+      unlinkSync(full)
+    } catch {
+      // Best effort; a live contender's file is seconds old and never matches.
+    }
+  }
+}
+
+function describeLockHolder(path: string): string {
+  try {
+    if (lstatSync(path).isSymbolicLink()) return 'symlink (refused)'
+    const record = JSON.parse(readFileSync(path, 'utf8')) as Partial<LockRecord>
+    const pid = typeof record.pid === 'number' ? record.pid : '?'
+    const host = typeof record.hostname === 'string' ? record.hostname : '?'
+    const started = typeof record.startedAt === 'string' ? record.startedAt : '?'
+    return `pid=${pid} host=${host} startedAt=${started}`
+  } catch {
+    return 'unknown'
+  }
+}
+
+function releaseLock(paths: StatePaths, token: string): void {
+  let record: LockRecord
+  try {
+    if (lstatSync(paths.lock).isSymbolicLink()) {
+      throw new HunterError(
+        'E_TRANSACTION_CONFLICT',
+        'Transaction lock is a symlink; results are not trustworthy',
+      )
+    }
+    record = JSON.parse(readFileSync(paths.lock, 'utf8')) as LockRecord
+  } catch (error) {
+    if (error instanceof HunterError) throw error
     // The lock may already have been removed by an operator-recovery step.
+    return
+  }
+  if (record.token !== token) {
+    throw new HunterError(
+      'E_TRANSACTION_CONFLICT',
+      'Transaction lock was stolen or replaced during the operation; results are not trustworthy',
+    )
+  }
+  try {
+    unlinkSync(paths.lock)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 }
 
 function isStaleLock(path: string): boolean {
+  let record: LockRecord
   try {
-    const record = JSON.parse(readFileSync(path, 'utf8')) as LockRecord
-    if (!Number.isSafeInteger(record.pid) || record.pid <= 0) return true
-    if (record.hostname !== hostname()) return true
-    try {
-      process.kill(record.pid, 0)
-      return false
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'ESRCH'
-    }
+    if (lstatSync(path).isSymbolicLink()) return false
+    record = JSON.parse(readFileSync(path, 'utf8')) as LockRecord
   } catch {
-    return true
+    // Corrupt locks are NOT treated as stale: deleting them would hide evidence
+    // of tampering. Require manual recovery instead.
+    return false
+  }
+  if (!Number.isSafeInteger(record.pid) || record.pid <= 0) return false
+  // Cross-host locks are never considered stale: on shared filesystems two hosts
+  // would otherwise both enter the critical section. Require manual recovery.
+  // Locks without a hostname predate the holder-identity field; fall back to pid liveness.
+  if (typeof record.hostname === 'string' && record.hostname !== hostname()) return false
+  try {
+    process.kill(record.pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
   }
 }
 

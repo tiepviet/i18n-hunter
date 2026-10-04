@@ -1,9 +1,10 @@
 import { createTwoFilesPatch } from 'diff'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, rmdirSync, statSync } from 'node:fs'
-import { atomicWriteFile } from './atomic-write.js'
+import { existsSync, lstatSync, mkdirSync, rmdirSync } from 'node:fs'
+import { atomicWriteFile, sanitizeFileMode } from './atomic-write.js'
 import { resolveStateRelativePath } from './discovery.js'
 import { HunterError, errorMessage } from './errors.js'
+import { scanLimitCeilings } from './limits.js'
 import type { Manifest } from './manifest-schema.js'
 import { canonicalizeRoot, resolveContainedSourcePath } from './path-policy.js'
 import { parseExtractionReport } from './report-schema.js'
@@ -75,9 +76,16 @@ export async function applyReport(reportPath: string, options: ApplyOptions): Pr
   const statePaths = resolveStatePaths(baseRoot, options.stateDir)
   const stateRelativePath = resolveStateRelativePath(baseRoot, options.stateDir)
   const grouped = groupFindings(report.findings)
+  // Never trust report-declared limits for resource exhaustion: cap by local ceilings.
+  const effectiveLimits = {
+    maxFileBytes: Math.min(report.scan.limits.maxFileBytes, scanLimitCeilings.maxFileBytes),
+    maxTotalBytes: Math.min(report.scan.limits.maxTotalBytes, scanLimitCeilings.maxTotalBytes),
+    maxFiles: Math.min(report.scan.limits.maxFiles, scanLimitCeilings.maxFiles),
+    maxFindings: Math.min(report.scan.limits.maxFindings, scanLimitCeilings.maxFindings),
+  }
   if (
-    grouped.size > report.scan.limits.maxFiles ||
-    report.findings.length > report.scan.limits.maxFindings
+    grouped.size > effectiveLimits.maxFiles ||
+    report.findings.length > effectiveLimits.maxFindings
   ) {
     throw new HunterError('E_FILE_LIMIT', 'Report exceeds its declared scan limits')
   }
@@ -90,9 +98,11 @@ export async function applyReport(reportPath: string, options: ApplyOptions): Pr
   }> = []
 
   for (const [filePath, findings] of grouped) {
+    // Case-insensitive on all platforms: `STATE` must not bypass the managed-state guard.
     if (
       stateRelativePath &&
-      (filePath === stateRelativePath || filePath.startsWith(`${stateRelativePath}/`))
+      (filePath.toLowerCase() === stateRelativePath.toLowerCase() ||
+        filePath.toLowerCase().startsWith(`${stateRelativePath.toLowerCase()}/`))
     ) {
       throw new HunterError(
         'E_PATH_OUTSIDE_ROOT',
@@ -101,18 +111,31 @@ export async function applyReport(reportPath: string, options: ApplyOptions): Pr
       )
     }
     const source = resolveContainedSourcePath(baseRoot, filePath)
-    const content = readTextFileBounded(source.path, report.scan.limits.maxFileBytes)
+    const content = readTextFileBounded(source.path, effectiveLimits.maxFileBytes)
     totalBytes += Buffer.byteLength(content, 'utf8')
-    if (totalBytes > report.scan.limits.maxTotalBytes) {
+    if (totalBytes > effectiveLimits.maxTotalBytes) {
       throw new HunterError('E_FILE_LIMIT', 'Report source bytes exceed maxTotalBytes')
     }
     const plan = await createFileTransformPlan(content, filePath, findings)
     if (!plan.changed) continue
+    let mode: number
+    try {
+      const stats = lstatSync(source.path)
+      if (stats.isSymbolicLink()) {
+        throw new HunterError('E_SYMLINK_REJECTED', 'Source path is a symlink', filePath)
+      }
+      // Sanitize at capture so manifests never store world-writable/executable
+      // bits observed on disk (e.g. a pre-existing 0o777 source file).
+      mode = sanitizeFileMode(stats.mode & 0o777)
+    } catch (error) {
+      if (error instanceof HunterError) throw error
+      throw new HunterError('E_IO', 'Unable to inspect source file', filePath)
+    }
     preflight.push({
       filePath,
       originalContent: content,
       plan,
-      mode: statSync(source.path).mode & 0o777,
+      mode,
     })
   }
 
@@ -157,21 +180,23 @@ export async function rollbackTransactions(options: {
     if (!latest && transactionIds.length > 0) {
       throw new HunterError(
         'E_ROLLBACK_FAILED',
-        'No active transaction, but orphaned state exists. Run `clean --yes` to remove it.',
+        'No active transaction, but orphaned state exists. Run `clean --yes` if all orphaned transactions are rolled back or prepared residue; otherwise manual recovery is required (see `clean` error details).',
       )
     }
     if (!latest) throw new HunterError('E_ROLLBACK_FAILED', 'No active transaction to roll back')
 
     const chain = loadTransactionChain(statePaths, latest.transactionId, baseRoot)
     const expectedCurrent = new Map<string, string>()
+    // Limit-less legacy manifests fall back to the ceiling, not the 2 MB
+    // default, so large-file chains do not wedge rollback.
+    const limitOf = (manifest: Manifest): number =>
+      manifest.limits?.maxFileBytes ?? scanLimitCeilings.maxFileBytes
     for (const item of chain) {
       for (const entry of item.manifest.entries) {
         const source = resolveContainedSourcePath(baseRoot, entry.filePath)
         const actual = expectedCurrent.has(entry.filePath)
           ? expectedCurrent.get(entry.filePath)!
-          : hashText(
-              readTextFileBounded(source.path, item.manifest.limits?.maxFileBytes ?? 2_000_000),
-            )
+          : hashText(readTextFileBounded(source.path, limitOf(item.manifest)))
         const validCurrentState = actual === entry.afterHash || actual === entry.beforeHash
         if (!validCurrentState) {
           throw new HunterError(
@@ -187,8 +212,7 @@ export async function rollbackTransactions(options: {
         )
         if (
           !existsSync(backup) ||
-          hashText(readTextFileBounded(backup, item.manifest.limits?.maxFileBytes ?? 2_000_000)) !==
-            entry.beforeHash
+          hashText(readTextFileBounded(backup, limitOf(item.manifest))) !== entry.beforeHash
         ) {
           throw new HunterError(
             'E_ROLLBACK_FAILED',
@@ -209,12 +233,19 @@ export async function rollbackTransactions(options: {
         })
       }
       const transactionRoot = transactionDirectory(statePaths, manifest.transactionId)
+      const limit = manifest.limits?.maxFileBytes ?? scanLimitCeilings.maxFileBytes
       for (const entry of manifest.entries) {
         const source = resolveContainedSourcePath(baseRoot, entry.filePath)
         const backup = resolveBackupPath(transactionRoot, entry.backupPath)
-        const currentHash = hashText(
-          readTextFileBounded(source.path, manifest.limits?.maxFileBytes ?? 2_000_000),
-        )
+        const backupContent = readTextFileBounded(backup, limit)
+        if (hashText(backupContent) !== entry.beforeHash) {
+          throw new HunterError(
+            'E_ROLLBACK_FAILED',
+            `Backup is missing or corrupt: ${entry.filePath}`,
+            entry.filePath,
+          )
+        }
+        const currentHash = hashText(readTextFileBounded(source.path, limit))
         if (currentHash !== entry.beforeHash) {
           if (currentHash !== entry.afterHash) {
             throw new HunterError(
@@ -224,16 +255,9 @@ export async function rollbackTransactions(options: {
             )
           }
           const verifiedSource = resolveContainedSourcePath(baseRoot, entry.filePath)
-          atomicWriteFile(
-            verifiedSource.path,
-            readTextFileBounded(backup, manifest.limits?.maxFileBytes ?? 2_000_000),
-            entry.mode,
-          )
+          atomicWriteFile(verifiedSource.path, backupContent, sanitizeFileMode(entry.mode))
         }
-        if (
-          hashText(readTextFileBounded(source.path, manifest.limits?.maxFileBytes ?? 2_000_000)) !==
-          entry.beforeHash
-        ) {
+        if (hashText(readTextFileBounded(source.path, limit)) !== entry.beforeHash) {
           throw new HunterError(
             'E_ROLLBACK_FAILED',
             `Rollback verification failed: ${entry.filePath}`,
@@ -314,11 +338,20 @@ export async function cleanTransactions(options: {
       }
       throw new HunterError(
         'E_CLEAN_FAILED',
-        `Transaction state requires manual recovery: ${manifest.state}`,
+        `Transaction state requires manual recovery: ${manifest.state} (${transactionId}). Roll back first, or remove the state directory manually if the chain is unrecoverable: ${statePaths.root}`,
         transactionId,
       )
     }
-    if (existsSync(statePaths.transactions)) rmdirSync(statePaths.transactions)
+    if (existsSync(statePaths.transactions)) {
+      try {
+        rmdirSync(statePaths.transactions)
+      } catch (error) {
+        throw new HunterError(
+          'E_CLEAN_FAILED',
+          `Unable to remove empty transactions directory: ${(error as Error).message}`,
+        )
+      }
+    }
     removeLatest(statePaths)
     return { removedTransactions: transactionIds.length }
   })
@@ -368,7 +401,7 @@ function commitTransaction(
     createdAt: now,
     updatedAt: now,
     projectRootHash: hashText(baseRoot),
-    reportHash: hashText(readTextFileBounded(reportPath, 25_000_000)),
+    reportHash: hashText(readTextFileBounded(reportPath, 20_000_000)),
     parentTransactionId: parentId,
     limits: { ...report.scan.limits },
     entries: [],
@@ -388,7 +421,8 @@ function commitTransaction(
       const source = resolveContainedSourcePath(baseRoot, item.filePath)
       const backupRelative = backupRelativePath(item.filePath)
       const backup = resolveBackupPath(transactionRoot, backupRelative, true)
-      atomicWriteFile(backup, readTextFileBounded(source.path, 10_000_000), item.mode)
+      // Backups contain complete source files: always restrictive, never source mode.
+      atomicWriteFile(backup, readTextFileBounded(source.path, 10_000_000), 0o600)
       if (hashText(readTextFileBounded(backup, 10_000_000)) !== item.plan.originalHash) {
         throw new HunterError(
           'E_APPLY_FAILED',
@@ -401,7 +435,7 @@ function commitTransaction(
         backupPath: backupRelative,
         beforeHash: item.plan.originalHash,
         afterHash: item.plan.finalHash,
-        mode: item.mode,
+        mode: sanitizeFileMode(item.mode),
       })
       writeManifest(statePaths, manifest)
     }
@@ -423,11 +457,11 @@ function commitTransaction(
       written.push({
         filePath: item.filePath,
         backupPath: backupRelativePath(item.filePath),
-        mode: item.mode,
+        mode: sanitizeFileMode(item.mode),
         originalHash: item.plan.originalHash,
         finalHash: item.plan.finalHash,
       })
-      atomicWriteFile(verifiedSource.path, item.plan.content, item.mode)
+      atomicWriteFile(verifiedSource.path, item.plan.content, sanitizeFileMode(item.mode))
       if (hashText(readTextFileBounded(verifiedSource.path, 10_000_000)) !== item.plan.finalHash) {
         throw new HunterError(
           'E_APPLY_FAILED',
@@ -461,6 +495,13 @@ function commitTransaction(
         const backup = resolveBackupPath(transactionRoot, item.backupPath)
         const backupContent = readTextFileBounded(backup, 10_000_000)
         const backupHash = hashText(backupContent)
+        // Verify the backup BEFORE overwriting the source: a corrupt backup must
+        // never clobber good source content.
+        if (backupHash !== item.originalHash) {
+          rollbackSucceeded = false
+          rollbackCause ??= new Error(`Automatic restore found a corrupt backup: ${item.filePath}`)
+          continue
+        }
         const currentHash = hashText(readTextFileBounded(source.path, 10_000_000))
         if (currentHash !== item.originalHash && currentHash !== item.finalHash) {
           rollbackSucceeded = false
@@ -468,8 +509,8 @@ function commitTransaction(
           continue
         }
         if (currentHash !== item.originalHash)
-          atomicWriteFile(source.path, backupContent, item.mode)
-        if (hashText(readTextFileBounded(source.path, 10_000_000)) !== backupHash) {
+          atomicWriteFile(source.path, backupContent, sanitizeFileMode(item.mode))
+        if (hashText(readTextFileBounded(source.path, 10_000_000)) !== item.originalHash) {
           rollbackSucceeded = false
           rollbackCause ??= new Error(`Automatic restore verification failed: ${item.filePath}`)
         }
@@ -515,10 +556,8 @@ function validateAppliedParentChain(
     }
     for (const entry of manifest.entries) {
       const source = resolveContainedSourcePath(baseRoot, entry.filePath)
-      if (
-        hashText(readTextFileBounded(source.path, manifest.limits?.maxFileBytes ?? 2_000_000)) !==
-        entry.afterHash
-      ) {
+      const limit = manifest.limits?.maxFileBytes ?? scanLimitCeilings.maxFileBytes
+      if (hashText(readTextFileBounded(source.path, limit)) !== entry.afterHash) {
         throw new HunterError(
           'E_STALE_SOURCE',
           `Parent source changed: ${entry.filePath}`,
@@ -528,8 +567,7 @@ function validateAppliedParentChain(
       const backup = resolveBackupPath(transactionDirectory(statePaths, current), entry.backupPath)
       if (
         !existsSync(backup) ||
-        hashText(readTextFileBounded(backup, manifest.limits?.maxFileBytes ?? 2_000_000)) !==
-          entry.beforeHash
+        hashText(readTextFileBounded(backup, limit)) !== entry.beforeHash
       ) {
         throw new HunterError(
           'E_ROLLBACK_FAILED',
@@ -575,7 +613,11 @@ function loadTransactionChain(
 }
 
 function parseReport(reportPath: string): ExtractionReport {
-  return parseExtractionReport(readJsonBounded(reportPath))
+  // Single 20 MB cap shared with the manifest `reportHash` read below, so a
+  // large-but-schema-valid report fails consistently instead of passing parse
+  // then failing at fingerprint time. A same-user swap between the two reads
+  // remains out of scope (see security-model).
+  return parseExtractionReport(readJsonBounded(reportPath, 20_000_000))
 }
 
 function groupFindings(findings: ScanResult[]): Map<string, ScanResult[]> {

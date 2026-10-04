@@ -2,6 +2,17 @@ import { parse, type ParserPlugin } from '@babel/parser'
 import { type NodePath } from '@babel/traverse'
 import * as t from '@babel/types'
 import { generate, traverse } from './babel-compat.js'
+import {
+  categoryForContext,
+  isTechnicalValue,
+  isVisibleText,
+  normalizeAttributeName,
+  notificationCallees,
+  technicalCallees,
+  translationModules,
+  userFacingAttributes,
+  userFacingVariableNames,
+} from './i18n-taxonomy.js'
 import { createSourceIndex, positionAt, trimRange, type SourceIndex } from './source-range.js'
 import type {
   ComponentContext,
@@ -23,61 +34,6 @@ export interface JavaScriptExtractionOptions {
   componentName?: string
   lineIndex?: SourceIndex
 }
-
-const userFacingAttributes = new Set([
-  'alt',
-  'aria-label',
-  'label',
-  'placeholder',
-  'title',
-  'tooltip',
-])
-
-const userFacingVariableNames = new Set([
-  'alert',
-  'description',
-  'detail',
-  'emptyText',
-  'error',
-  'errorText',
-  'heading',
-  'label',
-  'message',
-  'placeholder',
-  'subtitle',
-  'text',
-  'title',
-  'warning',
-])
-
-const notificationCallees = new Set(['toast', 'notify', 'notification'])
-const technicalCallees = new Set([
-  'console',
-  'fetch',
-  'localStorage',
-  'querySelector',
-  'require',
-  'sessionStorage',
-  'setItem',
-  'window.location',
-])
-const translationModules = new Set(['i18next', 'react-i18next', 'vue-i18n'])
-const buttonTags = new Set(['a', 'button', 'Button', 'Link', 'NavLink', 'RouterLink'])
-const labelTags = new Set([
-  'caption',
-  'dt',
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'label',
-  'legend',
-  'th',
-  'title',
-])
-const messageTags = new Set(['dd', 'figcaption', 'li', 'p', 'span', 'summary', 'td'])
 
 export function parseJavaScriptSource(options: JavaScriptExtractionOptions): ParseResult {
   const startOffset = options.startOffset ?? 0
@@ -162,6 +118,7 @@ export function parserPlugins(
   options: Pick<JavaScriptExtractionOptions, 'typescript' | 'jsx'>,
 ): ParserPlugin[] {
   const plugins: ParserPlugin[] = [
+    'asyncGenerators',
     'classProperties',
     'classPrivateProperties',
     'classPrivateMethods',
@@ -171,6 +128,7 @@ export function parserPlugins(
     'importAttributes',
     'importMeta',
     'nullishCoalescingOperator',
+    'objectRestSpread',
     'optionalChaining',
     'topLevelAwait',
   ]
@@ -197,7 +155,8 @@ function createStringLiteralCandidate(
   const jsxAttribute = path.findParent((parent) => parent.isJSXAttribute())
   if (jsxAttribute?.isJSXAttribute()) {
     if (!t.isJSXIdentifier(jsxAttribute.node.name)) return undefined
-    const attributeName = jsxAttribute.node.name.name
+    const rawName = jsxAttribute.node.name.name
+    const attributeName = normalizeAttributeName(rawName)
     if (!userFacingAttributes.has(attributeName)) return undefined
     return createCandidate({
       node,
@@ -212,24 +171,30 @@ function createStringLiteralCandidate(
     })
   }
 
-  const call = path.findParent((parent) => parent.isCallExpression())
-  if (call?.isCallExpression() && isTranslationCall(call, hasKnownTranslationBinding))
+  const ancestorCalls = collectAncestorCalls(path)
+  const nearestCall = ancestorCalls[0]
+  if (ancestorCalls.some((call) => isTranslationCall(call, hasKnownTranslationBinding)))
     return undefined
 
-  const notification = call?.isCallExpression() ? getNotificationType(call.node.callee) : null
+  const notification = findNearestNotification(ancestorCalls)
   const variable = userFacingVariableFromPath(path)
-  const technicalContext = call?.isCallExpression() ? isTechnicalCallee(call.node.callee) : false
-  if (technicalContext) return undefined
+  // Walk all ancestors: `console.log(foo('hello'))` is technical via the outer
+  // call even though the nearest callee is `foo`. Technical wins over
+  // notification (fail-closed: never extract logging/storage strings).
+  if (ancestorCalls.some((call) => isTechnicalCallee(call.node.callee))) return undefined
+  const jsxExpression = path.findParent((parent) => parent.isJSXExpressionContainer()) !== null
 
   const context = notification
     ? `notification:${notification}`
     : variable
       ? `variable:${variable}`
-      : call?.isCallExpression()
-        ? `call:${calleeName(call.node.callee).toLowerCase()}`
-        : 'script'
-  const isUserFacing = Boolean(notification || variable || isReturnString(path))
-  if (!isUserFacing || !isVisibleText(node.value)) return undefined
+      : jsxExpression
+        ? 'jsx-expression'
+        : nearestCall
+          ? `call:${calleeName(nearestCall.node.callee).toLowerCase()}`
+          : 'script'
+  const isUserFacing = Boolean(notification || variable || isReturnString(path) || jsxExpression)
+  if (!isUserFacing || !isVisibleText(node.value) || isTechnicalValue(node.value)) return undefined
 
   return createCandidate({
     node,
@@ -239,7 +204,8 @@ function createStringLiteralCandidate(
     startOffset,
     context,
     category: categoryForContext(context, node.value),
-    transform: 'script-string',
+    transform:
+      jsxExpression && !notification && !variable ? 'react-expression-string' : 'script-string',
     component: findComponent(path, componentMap, vueComponent),
     isNotification: Boolean(notification),
     notificationType: notification ?? undefined,
@@ -258,14 +224,20 @@ function createTemplateLiteralCandidate(
   if (typeof node.start !== 'number' || typeof node.end !== 'number') return undefined
   if (path.parentPath.isTaggedTemplateExpression()) return undefined
   const raw = options.content.slice(node.start, node.end)
+  // Pure `${x}` interpolations with no literal text are not findings; otherwise
+  // `renderTemplateLiteral` would emit `${x}` (containing a letter) and flag empty strings.
+  const hasLiteralText = node.quasis.some((quasi) =>
+    isVisibleText(quasi.value.cooked ?? quasi.value.raw ?? ''),
+  )
+  if (!hasLiteralText) return undefined
   const value = renderTemplateLiteral(node)
   if (!isVisibleText(value) || isTechnicalValue(value)) return undefined
 
-  const call = path.findParent((parent) => parent.isCallExpression())
-  if (call?.isCallExpression() && isTranslationCall(call, hasKnownTranslationBinding))
+  const ancestorCalls = collectAncestorCalls(path)
+  if (ancestorCalls.some((call) => isTranslationCall(call, hasKnownTranslationBinding)))
     return undefined
-  if (call?.isCallExpression() && isTechnicalCallee(call.node.callee)) return undefined
-  const notification = call?.isCallExpression() ? getNotificationType(call.node.callee) : null
+  if (ancestorCalls.some((call) => isTechnicalCallee(call.node.callee))) return undefined
+  const notification = findNearestNotification(ancestorCalls)
   const variable = userFacingVariableFromPath(path)
   const jsxExpression = path.findParent((parent) => parent.isJSXExpressionContainer()) !== null
   if (!notification && !variable && !jsxExpression && !isReturnString(path)) return undefined
@@ -300,6 +272,9 @@ function createJsxTextCandidate(
 ): ExtractedCandidate | undefined {
   const node = path.node
   if (typeof node.start !== 'number' || typeof node.end !== 'number') return undefined
+  // Babel decodes entities in `node.value` (`&amp;` → `&`) while the raw slice
+  // keeps the encoded source. Trim/range must use the raw slice so
+  // `content.slice(range.start, range.end) === raw`; only `value` is decoded.
   const value = node.value.trim()
   if (!isVisibleText(value)) return undefined
 
@@ -422,6 +397,20 @@ function collectReactComponents(
     componentMap.set(node, context)
   }
 
+  const registerWrapper = (init: t.CallExpression, name: string) => {
+    const callee = t.isIdentifier(init.callee)
+      ? init.callee.name
+      : t.isMemberExpression(init.callee) && t.isIdentifier(init.callee.property)
+        ? init.callee.property.name
+        : ''
+    if (callee === 'memo' || callee === 'forwardRef' || callee === 'observer') {
+      const first = init.arguments[0]
+      if (t.isArrowFunctionExpression(first) || t.isFunctionExpression(first)) {
+        register(first, name)
+      }
+    }
+  }
+
   traverse(ast, {
     FunctionDeclaration(path) {
       if (path.node.id) register(path.node, path.node.id.name)
@@ -429,12 +418,37 @@ function collectReactComponents(
     VariableDeclarator(path) {
       const { id, init } = path.node
       if (!t.isIdentifier(id) || !init) return
-      if (t.isArrowFunctionExpression(init) || t.isFunctionExpression(init)) register(init, id.name)
+      if (t.isArrowFunctionExpression(init) || t.isFunctionExpression(init)) {
+        register(init, id.name)
+        return
+      }
+      // `memo(() => <div/>)`, `forwardRef((props) => <div/>)`, `memo(function Card(){})`.
+      if (t.isCallExpression(init)) registerWrapper(init, id.name)
+    },
+    ExportNamedDeclaration(path) {
+      const declaration = path.node.declaration
+      if (t.isFunctionDeclaration(declaration) && declaration.id) {
+        register(declaration, declaration.id.name)
+      } else if (t.isVariableDeclaration(declaration)) {
+        for (const declarator of declaration.declarations) {
+          if (!t.isIdentifier(declarator.id) || !declarator.init) continue
+          if (
+            t.isArrowFunctionExpression(declarator.init) ||
+            t.isFunctionExpression(declarator.init)
+          ) {
+            register(declarator.init, declarator.id.name)
+          } else if (t.isCallExpression(declarator.init)) {
+            registerWrapper(declarator.init, declarator.id.name)
+          }
+        }
+      }
     },
     ExportDefaultDeclaration(path) {
       const declaration = path.node.declaration
       if (t.isFunctionDeclaration(declaration)) {
         register(declaration, declaration.id?.name ?? 'Default')
+      } else if (t.isArrowFunctionExpression(declaration) || t.isFunctionExpression(declaration)) {
+        register(declaration, 'Default')
       }
     },
   })
@@ -444,6 +458,8 @@ function findClosingParenEnd(content: string, start: number): number | undefined
   if (content[start] !== '(') return undefined
   let depth = 0
   let quote: '"' | "'" | '`' | undefined
+  let templateDepth = 0
+  let regex = false
   let lineComment = false
   let blockComment = false
   for (let index = start; index < content.length; index += 1) {
@@ -460,9 +476,29 @@ function findClosingParenEnd(content: string, start: number): number | undefined
       }
       continue
     }
-    if (quote) {
+    if (regex) {
       if (character === '\\') index += 1
-      else if (character === quote) quote = undefined
+      else if (character === '/') regex = false
+      continue
+    }
+    if (quote) {
+      if (character === '\\') {
+        index += 1
+        continue
+      }
+      // Inside a template literal, `${` enters an expression where parens count again.
+      if (quote === '`' && character === '$' && next === '{') {
+        templateDepth += 1
+        quote = undefined
+        index += 1
+        continue
+      }
+      if (character === quote) quote = undefined
+      continue
+    }
+    if (templateDepth > 0 && character === '}') {
+      templateDepth -= 1
+      quote = '`'
       continue
     }
     if (character === '/' && next === '/') {
@@ -474,6 +510,14 @@ function findClosingParenEnd(content: string, start: number): number | undefined
       blockComment = true
       index += 1
       continue
+    }
+    if (character === '/' && next !== '/' && next !== '*') {
+      // Heuristic regex start: preceded by `(`, `=`, `:`, `,`, `!`, `&`, `|`, `?`, `{`, `;` or start.
+      const prev = content.slice(0, index).trimEnd().slice(-1)
+      if (prev === '' || ' (=:,!&|?{;['.includes(prev)) {
+        regex = true
+        continue
+      }
     }
     if (character === '"' || character === "'" || character === '`') {
       quote = character
@@ -537,34 +581,77 @@ function isTranslationCall(
     callee === '$t' ||
     callee === 'i18n.t' ||
     callee === 'formatMessage' ||
-    callee === 'intl.formatMessage'
+    callee === 'intl.formatMessage' ||
+    callee === 'i18nT'
   )
     return true
-  return (
-    callee === 't' ||
-    callee === 'tc' ||
-    callee === 'te' ||
-    (hasKnownTranslationBinding && callee.endsWith('.t'))
-  )
+  // Bare `t/tc/te/translate` without an i18n import is likely a utility
+  // function, not a translation call. Only exclude when binding is proven.
+  if (!hasKnownTranslationBinding) return false
+  if (callee === 't' || callee === 'tc' || callee === 'te' || callee === 'translate') return true
+  if (callee.endsWith('.t') || callee.endsWith('.translate')) return true
+  return /(^|\.)t$/u.test(callee)
 }
 
 function getNotificationType(
   callee: t.Expression | t.V8IntrinsicIdentifier,
 ): NotificationType | null {
   const name = calleeName(callee)
+  // Bare `toast('msg')` / `notify('msg')` / `alert('msg')` are user-facing.
+  if (notificationCallees.has(name)) return 'info'
   const parts = name.split('.')
-  if (parts.length < 2 || !notificationCallees.has(parts[0]!)) return null
-  const method = parts.at(-1)!.toLowerCase()
-  if (method === 'success') return 'success'
-  if (method === 'error') return 'error'
-  if (method === 'info') return 'info'
-  if (method === 'warn' || method === 'warning') return 'warning'
+  if (parts.length >= 2) {
+    const head = parts[0]!
+    const tail = parts.at(-1)!.toLowerCase()
+    // `window.alert('x')` / `foo.message('x')`: trailing notification verb still
+    // marks the call as user-facing even when the receiver is not a notifier.
+    if (notificationCallees.has(head)) {
+      if (tail === 'success') return 'success'
+      if (tail === 'error') return 'error'
+      if (tail === 'info') return 'info'
+      if (tail === 'warn' || tail === 'warning') return 'warning'
+      // `toast.info('x')`-style unknown methods are still notifications.
+      return 'info'
+    }
+    if (tail === 'alert' || tail === 'notify' || tail === 'notification' || tail === 'toast') {
+      return 'info'
+    }
+    // `message.success('x')` (e.g. Ant Design) where `message` is the receiver.
+    if (head.toLowerCase() === 'message' || tail === 'message') return 'info'
+  }
+  return null
+}
+
+function collectAncestorCalls(path: NodePath): Array<NodePath<t.CallExpression>> {
+  const calls: Array<NodePath<t.CallExpression>> = []
+  let current: NodePath | null = path.parentPath
+  while (current) {
+    if (current.isCallExpression()) calls.push(current)
+    current = current.parentPath
+  }
+  return calls
+}
+
+function findNearestNotification(
+  calls: Array<NodePath<t.CallExpression>>,
+): NotificationType | null {
+  for (const call of calls) {
+    const type = getNotificationType(call.node.callee)
+    if (type) return type
+  }
   return null
 }
 
 function isTechnicalCallee(callee: t.Expression | t.V8IntrinsicIdentifier): boolean {
   const name = calleeName(callee)
-  return technicalCallees.has(name) || technicalCallees.has(name.split('.')[0]!)
+  if (technicalCallees.has(name)) return true
+  const first = name.split('.')[0]!
+  if (technicalCallees.has(first)) return true
+  // `window.location.href(...)` should match the `window.location` entry.
+  for (const entry of technicalCallees) {
+    if (name === entry || name.startsWith(`${entry}.`)) return true
+  }
+  return false
 }
 
 function userFacingVariableFromPath(path: NodePath<t.Node>): string | undefined {
@@ -578,37 +665,33 @@ function userFacingVariableFromPath(path: NodePath<t.Node>): string | undefined 
   if (parent?.isObjectProperty() && t.isIdentifier(parent.node.key) && !parent.node.computed) {
     return userFacingVariableNames.has(parent.node.key.name) ? parent.node.key.name : undefined
   }
+  // `useState('...')`, `useState<string>('...')`, param defaults `f(x = 'hi')`.
+  if (parent?.isCallExpression()) {
+    const callee = calleeName(parent.node.callee)
+    if (callee === 'useState' || callee.endsWith('.useState')) return 'text'
+  }
+  if (parent?.isAssignmentPattern()) {
+    const left = parent.node.left
+    if (t.isIdentifier(left) && userFacingVariableNames.has(left.name)) return left.name
+    return undefined
+  }
+  // Destructuring default: `const { title = 'Hi' } = props` — only when the
+  // key itself is user-facing.
+  if (parent?.isObjectProperty() && t.isAssignmentPattern(parent.node.value)) {
+    if (t.isIdentifier(parent.node.key) && userFacingVariableNames.has(parent.node.key.name)) {
+      return parent.node.key.name
+    }
+    return undefined
+  }
   return undefined
 }
 
 function isReturnString(path: NodePath<t.Node>): boolean {
-  return path.findParent((parent) => parent.isReturnStatement()) !== null
-}
-
-function isTechnicalValue(value: string): boolean {
-  return (
-    /^(?:https?:\/\/|data:|application\/|text\/|\/|\.{0,2}\/|[A-Za-z]:\\)/iu.test(value.trim()) ||
-    /^[a-z0-9_-]+(?:[./_-][a-z0-9_-]+)+$/iu.test(value.trim())
-  )
-}
-
-function isVisibleText(value: string): boolean {
-  return /[\p{L}\p{N}]/u.test(value)
-}
-
-function categoryForContext(context: string, value: string): FindingCategory {
-  if (context.startsWith('notification:')) return 'notification'
-  const tag = context.startsWith('tag:') ? context.slice(4) : ''
-  if (context.startsWith('tag:') && (buttonTags.has(tag) || buttonTags.has(tag.toLowerCase())))
-    return 'button'
-  if (context.startsWith('tag:') && (labelTags.has(tag) || labelTags.has(tag.toLowerCase())))
-    return 'label'
-  if (context.startsWith('tag:') && (messageTags.has(tag) || messageTags.has(tag.toLowerCase())))
-    return 'message'
-  if (/(error|failed|invalid|incorrect|wrong)/iu.test(value)) return 'error'
-  if (context.includes('error')) return 'error'
-  if (value.length > 30) return 'message'
-  return 'label'
+  const parent = path.parentPath
+  // Only a directly returned string counts. `return { foo: 'hi' }` is not
+  // evidence the value is user-facing; the object key determines that.
+  if (parent?.isReturnStatement()) return parent.node.argument === path.node
+  return false
 }
 
 function jsxTagName(element: t.JSXOpeningElement): string {

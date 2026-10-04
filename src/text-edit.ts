@@ -61,6 +61,20 @@ export function validateTextRange(content: string, finding: ScanResult): void {
 }
 
 export function applyTextEdits(content: string, edits: TextEdit[]): string {
+  for (const edit of edits) {
+    if (
+      !Number.isSafeInteger(edit.range.start) ||
+      !Number.isSafeInteger(edit.range.end) ||
+      edit.range.start < 0 ||
+      edit.range.end < edit.range.start ||
+      edit.range.end > content.length
+    ) {
+      throw new HunterError(
+        'E_REPORT_SCHEMA',
+        `Invalid edit range: ${edit.range.start}:${edit.range.end}`,
+      )
+    }
+  }
   assertNonOverlapping(edits)
   const eol = content.includes('\r\n') ? '\r\n' : '\n'
   let result = content

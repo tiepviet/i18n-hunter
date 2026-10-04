@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import picomatch from 'picomatch'
 import { globSync } from 'tinyglobby'
@@ -23,7 +23,7 @@ export interface DiscoveryResult {
   complete: boolean
 }
 
-export const defaultIncludePatterns = ['**/*.{vue,ts,tsx,js,jsx}']
+export const defaultIncludePatterns = ['**/*.{vue,ts,tsx,js,jsx,mts,cts,mjs,cjs}']
 export const defaultExcludePatterns = [
   '**/node_modules/**',
   '**/.git/**',
@@ -49,12 +49,21 @@ export function discoverSourceFiles(basePath: string, options: DiscoveryOptions)
   const requestedExcludes = options.excludePatterns ?? []
   const includePatterns = requestedIncludes.length > 0 ? requestedIncludes : defaultIncludePatterns
   const stateRelativePath = resolveStateRelativePath(root, options.stateDir)
-  const mandatoryExcludes = stateRelativePath ? [`${stateRelativePath}/**`] : []
+  const mandatoryExcludes = stateRelativePath ? [`${escapeGlob(stateRelativePath)}/**`] : []
   const excludePatterns = [
     ...new Set([...defaultExcludePatterns, ...mandatoryExcludes, ...requestedExcludes]),
   ]
   const diagnostics: Diagnostic[] = []
   const found = new Set<string>()
+
+  if (options.scanPaths.length === 0) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'E_SCAN_PATH_MISSING',
+      message: 'At least one scan path is required',
+    })
+    return { files: [], diagnostics, limits, complete: false }
+  }
 
   for (const scanPath of options.scanPaths) {
     const safeScanPath = normalizeScanPath(scanPath)
@@ -104,6 +113,29 @@ export function discoverSourceFiles(basePath: string, options: DiscoveryOptions)
     }
 
     if (stats.isFile()) {
+      if (lstatSync(fullScanPath).isSymbolicLink()) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'E_SYMLINK_REJECTED',
+          message: `Scan path symlink is not allowed: ${safeScanPath}`,
+          filePath: safeScanPath,
+        })
+        continue
+      }
+      // A direct file scan path must still respect the managed-state exclusion.
+      if (
+        stateRelativePath &&
+        (safeScanPath.toLowerCase() === stateRelativePath.toLowerCase() ||
+          safeScanPath.toLowerCase().startsWith(`${stateRelativePath.toLowerCase()}/`))
+      ) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'E_PATH_OUTSIDE_ROOT',
+          message: `Scan path is managed transaction state: ${safeScanPath}`,
+          filePath: safeScanPath,
+        })
+        continue
+      }
       validatePortableRelativePath(safeScanPath, sourceExtensions)
       found.add(safeScanPath)
       continue
@@ -154,6 +186,14 @@ export function discoverSourceFiles(basePath: string, options: DiscoveryOptions)
     ...findSymlinkDiagnostics(root, options.scanPaths, excludePatterns, limits.maxDepth),
   )
 
+  if (depthLimitReached(root, options.scanPaths, excludePatterns, limits.maxDepth)) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'E_FILE_LIMIT',
+      message: `Discovery depth limit reached (${limits.maxDepth}); scan is incomplete`,
+    })
+  }
+
   const sorted = [...found].sort((left, right) => left.localeCompare(right))
   const files = sorted.slice(0, limits.maxFiles)
   if (sorted.length > limits.maxFiles) {
@@ -187,6 +227,11 @@ function findSymlinkDiagnostics(
     try {
       entries = readdirSync(directory, { withFileTypes: true })
     } catch {
+      diagnostics.push({
+        severity: 'error',
+        code: 'E_IO',
+        message: `Unable to read directory during discovery: ${relative(root, directory).split(sep).join('/') || '.'}`,
+      })
       return
     }
     for (const entry of entries) {
@@ -223,6 +268,58 @@ function findSymlinkDiagnostics(
   return diagnostics
 }
 
+function depthLimitReached(
+  root: string,
+  scanPaths: string[],
+  excludePatterns: string[],
+  maxDepth: number,
+): boolean {
+  const excluded = picomatch(excludePatterns, { dot: false })
+  const visit = (directory: string, depth: number): boolean => {
+    if (depth < maxDepth) {
+      let entries
+      try {
+        entries = readdirSync(directory, { withFileTypes: true })
+      } catch {
+        return false
+      }
+      for (const entry of entries) {
+        const relativePath = relative(root, join(directory, entry.name)).split(sep).join('/')
+        if (excluded(relativePath)) continue
+        if (entry.isSymbolicLink()) continue
+        if (entry.isDirectory() && visit(join(directory, entry.name), depth + 1)) return true
+      }
+      return false
+    }
+    // At the depth limit: any non-excluded subdirectory means truncation.
+    let entries
+    try {
+      entries = readdirSync(directory, { withFileTypes: true })
+    } catch {
+      return false
+    }
+    return entries.some((entry) => {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) return false
+      const relativePath = relative(root, join(directory, entry.name)).split(sep).join('/')
+      return !excluded(relativePath)
+    })
+  }
+
+  for (const scanPath of scanPaths) {
+    const normalized = normalizeScanPath(scanPath)
+    const directory = normalized === '.' ? root : resolve(root, normalized)
+    if (
+      existsSync(directory) &&
+      lstatSync(directory).isDirectory() &&
+      !lstatSync(directory).isSymbolicLink() &&
+      visit(directory, 0)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * Resolves the managed state directory to a portable, root-relative path when it
  * lives inside the scanned project. Returns `undefined` for external state
@@ -249,6 +346,10 @@ function normalizeScanPath(path: string): string {
   return path
 }
 
+function escapeGlob(value: string): string {
+  return value.replace(/[*?[\]{}()!+@]/gu, (character) => `\\${character}`)
+}
+
 export function fileSize(path: string): number {
-  return statSync(path).size
+  return lstatSync(path).size
 }

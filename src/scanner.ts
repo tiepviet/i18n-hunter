@@ -7,7 +7,11 @@ import { HunterError, safeMessage } from './errors.js'
 import { discoverSourceFiles } from './discovery.js'
 import { generateSmartKey, shortHash } from './key-generator.js'
 import { resolveScanLimits } from './limits.js'
-import { canonicalizeRoot, isVueSourcePath, resolveContainedSourcePath } from './path-policy.js'
+import {
+  canonicalizeRoot,
+  isVueSourcePath,
+  resolveContainedSourcePathFromCanonicalRoot,
+} from './path-policy.js'
 import { parseReactSource } from './react-parser.js'
 import { ExtractionReportSchema } from './report-schema.js'
 import { hashText } from './source-range.js'
@@ -42,20 +46,30 @@ export async function scanForHardcodedStrings(
   let filesScanned = 0
   let totalBytes = 0
 
-  for (const filePath of discovery.files) {
-    const resolved = resolveContainedSourcePath(root, filePath)
+  // `root` is canonicalized once here and reused for every file via the
+  // canonical-root path-policy variant (avoids a per-file realpathSync).
+  for (let index = 0; index < discovery.files.length; index += 1) {
+    const filePath = discovery.files[index] as string
     let content: string
     try {
+      // Resolve + read are both TOCTOU-prone (delete/symlink swap between
+      // discovery and scan); either failure is a per-file E_IO, never fatal.
+      const resolved = resolveContainedSourcePathFromCanonicalRoot(root, filePath)
       content = readTextFileBounded(resolved.path, limits.maxFileBytes)
     } catch (error) {
+      const code =
+        error instanceof HunterError &&
+        (error.code === 'E_SYMLINK_REJECTED' ||
+          error.code === 'E_PATH_OUTSIDE_ROOT' ||
+          error.code === 'E_FILE_LIMIT' ||
+          error.code === 'E_IO')
+          ? error.code
+          : 'E_IO'
       diagnostics.push({
         severity: 'error',
-        code:
-          error instanceof Error && 'code' in error && error.code === 'E_FILE_LIMIT'
-            ? 'E_FILE_LIMIT'
-            : 'E_IO',
+        code,
         message:
-          error instanceof Error && 'code' in error && error.code === 'E_FILE_LIMIT'
+          code === 'E_FILE_LIMIT'
             ? `File exceeds maxFileBytes (${limits.maxFileBytes})`
             : 'Unable to read source file',
         filePath,
@@ -70,6 +84,14 @@ export async function scanForHardcodedStrings(
         message: 'Maximum total scan bytes exceeded',
         filePath,
       })
+      const remaining = discovery.files.length - index - 1
+      if (remaining > 0) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'E_FILE_LIMIT',
+          message: `Maximum total scan bytes exceeded: ${remaining} file(s) skipped`,
+        })
+      }
       break
     }
 
@@ -230,7 +252,10 @@ function createReport(
   }
 
   let report = buildReport()
-  if (Buffer.byteLength(JSON.stringify(report), 'utf8') > 20_000_000) {
+  // Single serialization for the 20 MB safety guard: store the string, measure
+  // it, and reuse the already-built report (no second stringify).
+  const serialized = JSON.stringify(report)
+  if (Buffer.byteLength(serialized, 'utf8') > 20_000_000) {
     boundedDiagnostics = boundDiagnostics([
       ...boundedDiagnostics,
       {
@@ -240,6 +265,12 @@ function createReport(
       },
     ])
     report = buildReport()
+    // Fail-closed: the rebuilt report still contains every finding, so it is
+    // almost certainly still oversized. Never return an oversized report.
+    const resealed = JSON.stringify(report)
+    if (Buffer.byteLength(resealed, 'utf8') > 20_000_000) {
+      throw new HunterError('E_FILE_LIMIT', 'Serialized report exceeds 20MB')
+    }
   }
   try {
     return ExtractionReportSchema.parse(report)
@@ -280,7 +311,7 @@ function scopeFromFile(filePath: string): string {
   const withoutExtension = filePath.replace(/\.[^.]+$/u, '')
   const segments = withoutExtension.split('/').filter(Boolean)
   const fileName = segments.pop() ?? 'common'
-  if (!/^(?:index|app)$/iu.test(fileName) && segments.length >= 0) {
+  if (!/^(?:index|app)$/iu.test(fileName)) {
     segments.push(fileName)
   } else if (segments.length === 0) {
     segments.push('common')

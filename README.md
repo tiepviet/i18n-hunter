@@ -75,25 +75,30 @@ i18n-hunter scan [options]
 
 Key options:
 
-| Option                              | Description                         | Default              |
-| ----------------------------------- | ----------------------------------- | -------------------- |
-| `--base <dir>`                      | Project root                        | Current directory    |
-| `--path <path>`                     | File/directory to scan; repeatable  | `src`                |
-| `--paths <a,b>`                     | Comma-separated compatibility alias | —                    |
-| `--output <dir>`                    | Report directory                    | `i18n-reports`       |
-| `--filename <name>`                 | Report basename                     | Timestamp-based name |
-| `--format <json\|md\|json,md>`      | Report formats                      | `json,md`            |
-| `--include-values`                  | Include source text in reports      | Redacted             |
-| `--redact-values`                   | Explicitly select the safe default  | Redacted             |
-| `--readable-keys`                   | Opt in to value-derived key names   | Opaque keys          |
-| `--fail-on <error\|warning\|never>` | Partial-scan exit policy            | `error`              |
-| `--max-file-size <bytes>`           | Per-file limit                      | 2 MB                 |
-| `--max-files <count>`               | File-count limit                    | 10,000               |
-| `--max-total-bytes <bytes>`         | Total source limit                  | 100 MB               |
-| `--max-findings <count>`            | Finding limit                       | 10,000               |
-| `--max-depth <count>`               | Discovery depth limit               | 50                   |
+| Option                              | Description                          | Default              |
+| ----------------------------------- | ------------------------------------ | -------------------- |
+| `--base <dir>`                      | Project root                         | Current directory    |
+| `--path <path>`                     | File/directory to scan; repeatable   | `src`                |
+| `--paths <a,b>`                     | Comma-separated compatibility alias  | —                    |
+| `--output <dir>`                    | Report directory                     | `i18n-reports`       |
+| `--filename <name>`                 | Report basename                      | Timestamp-based name |
+| `--format <json\|md\|json,md>`      | Report formats                       | `json,md`            |
+| `--include-values`                  | Include source text in reports       | Redacted             |
+| `--redact-values`                   | Explicitly select the safe default   | Redacted             |
+| `--readable-keys`                   | Opt in to value-derived key names    | Opaque keys          |
+| `--state-dir <dir>`                 | Managed state dir excluded from scan | —                    |
+| `--fail-on <error\|warning\|never>` | Partial-scan exit policy             | `error`              |
+| `--max-file-size <bytes>`           | Per-file limit                       | 2 MB                 |
+| `--max-files <count>`               | File-count limit                     | 10,000               |
+| `--max-total-bytes <bytes>`         | Total source limit                   | 100 MB               |
+| `--max-findings <count>`            | Finding limit                        | 10,000               |
+| `--max-depth <count>`               | Discovery depth limit                | 50                   |
 
-Tests, dependency output, generated output, reports, and transaction state are excluded by default. Symlinks are rejected.
+Tests, dependency output, generated output, reports, and transaction state are excluded by default. Symlinks are rejected. Pass the same `--state-dir` to `scan` as to `apply`/`rollback`/`clean` when using a custom state directory; otherwise the custom directory will be scanned as source.
+
+Reports use opaque random keys by default, so two identical scans produce different `suggestedKey` values and timestamps. Use `--readable-keys` for stable value-derived keys when diffing reports in CI. `exportReport` never overwrites: colliding basenames suffix `-1…-100`.
+
+One unsupported finding makes the report `complete:false` and `apply` refuses the whole batch. `apply` lists every unsupported finding (`file:line (transform)`) so the batch can be resolved manually and regenerated.
 
 ### `apply`
 
@@ -135,20 +140,23 @@ The state directory is never treated as source: `scan` excludes it and `apply` r
 
 ### Vue
 
-- Static and bound user-facing attributes
-- `v-text` literal expressions
+- Static and bound user-facing attributes (case-insensitive; `aria-*` included)
+- `v-text` literal expressions and string literals in `{{ }}` interpolations
 - Template text nodes
 - String and interpolated template literals in `<script setup>`
+- Pug/Jade and external-block templates are rejected with an error diagnostic, not silently misparsed
 
 ### React
 
 - JSX text and user-facing string attributes
-- String literals in JSX expression containers
+- String literals in JSX expression containers (`<div>{'Hi'}</div>`)
 - String and interpolated template literals in function components
-- Multiple function components in one file
-- `use client` directives are preserved
+- Multiple function components in one file, including `export function/const` and `memo`/`forwardRef`/`observer` wrappers (direct and `export const X = memo(…)` forms)
+- Bare `toast('msg')` notifications, `useState('...')` initials, and user-facing parameter/destructuring defaults
+- `use client` directives, shebangs, and license headers are preserved
+- `React.useTranslation()` namespaced hooks are recognized
 
-Class components, plain utility modules, React render functions outside a component scope, and Vue Options API script strings are reported as unsupported rather than transformed with an unsafe hook. Resolve those findings manually and regenerate the report.
+Class components, plain utility modules, React render functions outside a component scope, and Vue Options API script strings are reported as unsupported rather than transformed with an unsafe hook. `apply` lists every unsupported finding (`file:line (transform)`) so the batch can be resolved manually and regenerated. Vue Options API template-only findings do not require a script binding and are transformable.
 
 ## Privacy
 
